@@ -1,3 +1,5 @@
+import * as dotenv from 'dotenv';
+dotenv.config();
 import TelegramBot from 'node-telegram-bot-api';
 import { Signal } from '../core/strategy.interface';
 import { logger } from '../utils/logger';
@@ -14,7 +16,7 @@ function getBot(): TelegramBot | null {
 async function send(message: string): Promise<void> {
   const b = getBot();
   if (!b || !chatId) {
-    logger.debug('Telegram not configured, skipping');
+    logger.info('Telegram not configured, skipping');
     return;
   }
   try {

@@ -1,3 +1,4 @@
+import { getDb, testConnection } from '../db/connection';
 import { walletQueries, walletTradeQueries } from '../db/queries';
 import { logger } from '../utils/logger';
 
@@ -32,6 +33,11 @@ export async function runWalletSync(limit = 150, minVol = 5000) {
 
   const profiles = await fetchLeaderboard(limit, minVol);
   logger.info(`[wallet-sync] fetched ${profiles.length} wallets`);
+
+  await getDb();
+  const ok = await testConnection();
+  if (!ok) { logger.error('DB connection failed'); process.exit(1); }
+  
 
   let updated = 0;
   let errors  = 0;

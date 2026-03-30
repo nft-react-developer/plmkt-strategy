@@ -92,7 +92,7 @@ async function runStrategy(strategyId: string, params: Record<string, unknown>) 
     // Re-check si sigue habilitada (puede haberse deshabilitado en runtime)
     const config = await strategyQueries.getById(strategyId);
     if (!config?.enabled) {
-      logger.debug(`[${strategyId}] disabled at runtime, skipping tick`);
+      logger.info(`[${strategyId}] disabled at runtime, skipping tick`);
       return;
     }
 

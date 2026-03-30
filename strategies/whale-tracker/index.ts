@@ -1,19 +1,10 @@
 /**
  * S1: Whale Tracker
- *
- * Sigue wallets con alto volumen y emite un signal cuando
- * una wallet "top" abre una posición grande.
- *
- * Parámetros configurables (via DB strategy_config.params):
- *   intervalSeconds  — cada cuánto corre (default 120)
- *   topN             — cuántas wallets top trackear (default 30)
- *   minWinRate       — win rate mínimo para considerar una wallet (default 0.60)
- *   minTrades        — trades mínimos históricos (default 20)
- *   alertThresholdUsdc — tamaño mínimo de trade para alertar (default 500)
  */
 
 import { Strategy, StrategyRunResult } from '../../core/strategy.interface';
 import { walletQueries, walletTradeQueries } from '../../db/queries';
+import { CooldownManager } from '../../core/cooldown';
 import { logger } from '../../utils/logger';
 
 interface WhaleParams {
@@ -22,10 +13,10 @@ interface WhaleParams {
   minWinRate:           number;
   minTrades:            number;
   alertThresholdUsdc:   number;
+  cooldownMinutes:      number;
 }
 
-// Guarda el último trade visto por wallet para no re-alertar
-const lastSeenTrade: Map<string, string> = new Map();
+const cooldown = new CooldownManager('whale_tracker');
 
 export const whaleTrackerStrategy: Strategy = {
   id:          'whale_tracker',
@@ -38,35 +29,35 @@ export const whaleTrackerStrategy: Strategy = {
     minWinRate:         0.60,
     minTrades:          20,
     alertThresholdUsdc: 500,
+    cooldownMinutes:    120,
   } satisfies WhaleParams,
 
   async run(params): Promise<StrategyRunResult> {
-    const p = params as unknown as WhaleParams;
-    const signals = [];
-    const topWallets = await walletQueries.getTopByScore(p.topN);
+    const p          = params as unknown as WhaleParams;
+    const signals: StrategyRunResult['signals'] = [];
+    const cooldownMs = p.cooldownMinutes * 60_000;
 
-    // Filtrar por win rate y trades mínimos
-    const qualified = topWallets.filter(w =>
+    const topWallets = await walletQueries.getTopByScore(p.topN);
+    const qualified  = topWallets.filter(w =>
       Number(w.winRatePct ?? 0) >= p.minWinRate * 100 &&
       w.totalTrades >= p.minTrades,
     );
 
-    logger.debug(`[whale_tracker] checking ${qualified.length} wallets`);
+    logger.info(`[whale_tracker] checking ${qualified.length} wallets`);
 
     for (const wallet of qualified) {
       const recentTrades = await walletTradeQueries.getRecentForWallet(wallet.address, 5);
       if (!recentTrades.length) continue;
 
-      const latest = recentTrades[0];
-      const tradeKey = `${wallet.address}:${latest.txHash ?? latest.tradedAt.toISOString()}`;
-
-      // Ya alertamos por este trade
-      if (lastSeenTrade.get(wallet.address) === tradeKey) continue;
-
+      const latest    = recentTrades[0];
       const usdcValue = Number(latest.usdcValue ?? 0);
       if (usdcValue < p.alertThresholdUsdc) continue;
 
-      lastSeenTrade.set(wallet.address, tradeKey);
+      // Key incluye el txHash para que cada trade único solo alerte una vez
+      const key = `${wallet.address}:${latest.txHash ?? latest.tradedAt.toISOString()}`;
+      if (!(await cooldown.isReady(key, cooldownMs))) continue;
+
+      await cooldown.stamp(key);
 
       const label = wallet.label ?? wallet.address.slice(0, 10) + '…';
       const wr    = Number(wallet.winRatePct ?? 0).toFixed(1);
@@ -84,23 +75,13 @@ export const whaleTrackerStrategy: Strategy = {
           `<b>Tamaño:</b> $${usdcValue.toFixed(2)} USDC`,
         ].join('\n'),
         metadata: {
-          walletAddress: wallet.address,
-          marketId:      latest.marketId,
-          side:          latest.side,
-          price:         latest.price,
-          usdcValue,
-          txHash:        latest.txHash,
+          walletAddress: wallet.address, marketId: latest.marketId,
+          side: latest.side, price: latest.price, usdcValue, txHash: latest.txHash,
         },
-      } as const);
+      });
     }
 
-    return {
-      signals,
-      metrics: {
-        walletsChecked: qualified.length,
-        signalsFired:   signals.length,
-      },
-    };
+    return { signals, metrics: { walletsChecked: qualified.length, signalsFired: signals.length } };
   },
 
   async init(params) {

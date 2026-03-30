@@ -15,7 +15,7 @@
 
 import 'dotenv/config';
 import { walletQueries, walletTradeQueries } from '../db/queries';
-import { testConnection, closeDb } from '../db/connection';
+import { testConnection, closeDb, getDb } from '../db/connection';
 import { logger } from '../utils/logger';
 
 // ─── CLI args ────────────────────────────────────────────────────────────────
@@ -64,6 +64,7 @@ interface PolyTrade {
 async function main() {
   logger.info(`🔄 Wallet sync starting — limit: ${limit}, minVol: $${minVol}`);
 
+  await getDb();
   const ok = await testConnection();
   if (!ok) { logger.error('DB connection failed'); process.exit(1); }
 
@@ -95,7 +96,7 @@ async function main() {
       await syncRecentTrades(profile.proxyWallet);
 
       updated++;
-      logger.debug(`✓ ${profile.proxyWallet.slice(0, 10)}… score=${smartScore.toFixed(2)} wr=${(winRate*100).toFixed(1)}%`);
+      logger.info(`✓ ${profile.proxyWallet.slice(0, 10)}… score=${smartScore.toFixed(2)} wr=${(winRate*100).toFixed(1)}%`);
 
     } catch (err) {
       errors++;
