@@ -58,7 +58,7 @@ export async function fetchActiveMarkets(
   const url = `${base}/markets?closed=false&limit=${limit}&order=volume24hr&ascending=false`;
   const res  = await fetch(url, { signal: AbortSignal.timeout(10_000) });
   if (!res.ok) throw new Error(`gamma API ${res.status}`);
-  const data: GammaMarket[] = await res.json();
+  const data: GammaMarket[] = await res.json() as GammaMarket[];
   return data.filter(m => Number(m.volume24hr ?? 0) >= minVolume && m.clobTokenIds);
 }
 
@@ -74,6 +74,6 @@ export async function fetchResolvedMarkets(
   const url = `${base}/markets?closed=true&limit=${limit}&order=volume24hr&ascending=false`;
   const res  = await fetch(url, { signal: AbortSignal.timeout(10_000) });
   if (!res.ok) throw new Error(`gamma API ${res.status}`);
-  const data: GammaMarket[] = await res.json();
+  const data: GammaMarket[] = await res.json() as GammaMarket[];
   return data.filter(m => Number(m.volume24hr ?? 0) >= minVolume && m.clobTokenIds);
 }
