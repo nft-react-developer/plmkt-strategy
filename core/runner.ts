@@ -194,7 +194,7 @@ async function runDailyReport() {
       strategyId:   strategy.id,
       name:         strategy.name,
       winRatePct:   wr.winRatePct,
-      totalSignals: wr.correct + wr.incorrect + wr.neutral + wr.resolved,
+      totalSignals: wr.correct + wr.incorrect + wr.neutral,
       pending:      0,
     };
     summaries.push(entry);
