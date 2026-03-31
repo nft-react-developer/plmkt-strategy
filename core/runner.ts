@@ -4,6 +4,7 @@ import { telegram } from '../telegram/notifier';
 import { logger } from '../utils/logger';
 import { Signal } from './strategy.interface';
 import { runWalletSync } from './auto-sync-wallet';
+import { scheduleOutcomeResolver } from './resolve-outcomes';
 
 interface ActiveTimer {
   strategyId: string;
@@ -46,6 +47,7 @@ export async function startRunner() {
 
   scheduleWalletSync();
   scheduleDailyReport();
+  scheduleOutcomeResolver(); // corre cada noche a las 03:00 UTC
   logger.info('✅ Runner started');
 }
 
@@ -125,11 +127,11 @@ function scheduleWalletSync(intervalHours = 8) {
   const intervalMs = (Number(process.env.WALLET_SYNC_INTERVAL_HOURS) || intervalHours) * 3_600_000;
 
   // Correr inmediatamente al arrancar (en background, no bloquea el arranque)
-  runWalletSync().catch(err => logger.error('wallet-sync initial run failed', err));
+  runWalletSync().catch((err : any) => logger.error('wallet-sync initial run failed', err));
 
   // Luego cada N horas
   setInterval(() => {
-    runWalletSync().catch(err => logger.error('wallet-sync scheduled run failed', err));
+    runWalletSync().catch((err : any) => logger.error('wallet-sync scheduled run failed', err));
   }, intervalMs);
 
   logger.info(`[wallet-sync] scheduled every ${intervalHours}h`);
@@ -150,7 +152,7 @@ async function handleSignal(signal: Signal) {
   }).catch(e => logger.error('signal insert failed', e));
 
   // Enviar a Telegram
-  await telegram.sendSignal(signal);
+ // await telegram.sendSignal(signal);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
