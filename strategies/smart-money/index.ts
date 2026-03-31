@@ -1,5 +1,17 @@
 /**
  * S2: Smart Money Detector
+ *
+ * Detecta wallets que históricamente entraron temprano en mercados
+ * que luego se resolvieron en su favor. Construye un "smart score"
+ * ponderado y alerta cuando varias wallets top confluyen en un mercado.
+ *
+ * Parámetros configurables:
+ *   intervalSeconds      — default 300 (5 min)
+ *   minSmartScore        — score mínimo para considerar una wallet (default 5.0)
+ *   minWalletsConfluence — cuántas wallets top deben coincidir (default 2)
+ *   lookbackHours        — ventana de tiempo para buscar confluencia (default 6)
+ *   minMarketVolume      — volumen mínimo USDC del mercado (default 1000)
+ *   cooldownMinutes      — cooldown por mercado (default 120)
  */
 
 import { Strategy, StrategyRunResult } from '../../core/strategy.interface';
@@ -38,6 +50,7 @@ export const smartMoneyStrategy: Strategy = {
     const cooldownMs = p.cooldownMinutes * 60_000;
     const since      = new Date(Date.now() - p.lookbackHours * 3_600_000);
 
+    // Wallets con smart score suficiente
     const smartWallets = (await walletQueries.getTopByScore(100)).filter(
       w => Number(w.smartScore ?? 0) >= p.minSmartScore,
     );
@@ -47,6 +60,7 @@ export const smartMoneyStrategy: Strategy = {
       return { signals };
     }
 
+    // Agrupar trades recientes por mercado
     const marketCounts = new Map<string, {
       title:   string | null;
       wallets: Array<{ address: string; score: number; side: string; price: number }>;
@@ -54,13 +68,22 @@ export const smartMoneyStrategy: Strategy = {
 
     for (const wallet of smartWallets) {
       const recentTrades = await walletTradeQueries.getRecentForWallet(wallet.address, 10);
+
       for (const trade of recentTrades) {
         if (trade.tradedAt < since) continue;
+
+        // Filtrar por volumen mínimo del mercado (evita mercados sin liquidez)
+        // Nota: usdcValue puede ser null si el trade viene del leaderboard sin datos completos
+        const tradeValue = Number(trade.usdcValue ?? 0);
+        if (tradeValue > 0 && tradeValue < p.minMarketVolume) continue;
+
         let entry = marketCounts.get(trade.marketId);
         if (!entry) {
           entry = { title: trade.marketTitle ?? null, wallets: [] };
           marketCounts.set(trade.marketId, entry);
         }
+
+        // Evitar duplicar la misma wallet en el mismo mercado
         if (!entry.wallets.find(w => w.address === wallet.address)) {
           entry.wallets.push({
             address: wallet.address,
@@ -72,9 +95,11 @@ export const smartMoneyStrategy: Strategy = {
       }
     }
 
+    // Filtrar mercados con suficiente confluencia
     for (const [marketId, data] of marketCounts) {
       if (data.wallets.length < p.minWalletsConfluence) continue;
 
+      // Cooldown por mercado
       const key = marketId;
       if (!(await cooldown.isReady(key, cooldownMs))) continue;
 
@@ -90,6 +115,11 @@ export const smartMoneyStrategy: Strategy = {
         .map(w => `  <code>${w.address.slice(0, 10)}…</code> score: ${w.score.toFixed(2)} | ${w.side.toUpperCase()} @ ${w.price.toFixed(4)}`)
         .join('\n');
 
+      // Nota: "SELL" en Polymarket puede ser toma de ganancias, no necesariamente bajista
+      const dominantNote = dominant === 'SELL'
+        ? 'SELL (puede ser toma de ganancias)'
+        : 'BUY';
+
       signals.push({
         strategyId: this.id,
         severity:   data.wallets.length >= 4 ? 'high' : data.wallets.length >= 3 ? 'medium' : 'low',
@@ -97,7 +127,7 @@ export const smartMoneyStrategy: Strategy = {
         body: [
           `<b>Mercado:</b> ${data.title ?? marketId}`,
           `<b>Confluencia:</b> ${data.wallets.length} wallets inteligentes`,
-          `<b>Dirección dominante:</b> ${dominant} (${Math.max(buys, sells)}/${data.wallets.length})`,
+          `<b>Dirección dominante:</b> ${dominantNote} (${Math.max(buys, sells)}/${data.wallets.length})`,
           `<b>Precio promedio entrada:</b> ${avgPrice.toFixed(4)}`,
           `<b>Avg smart score:</b> ${avgScore.toFixed(2)}`,
           '',
@@ -105,15 +135,24 @@ export const smartMoneyStrategy: Strategy = {
           walletLines,
         ].join('\n'),
         metadata: {
-          marketId, marketTitle: data.title, walletCount: data.wallets.length,
-          dominant, avgPrice, avgScore, wallets: data.wallets.map(w => w.address),
+          marketId,
+          marketTitle:  data.title,
+          walletCount:  data.wallets.length,
+          dominant,
+          avgPrice,
+          avgScore,
+          wallets: data.wallets.map(w => w.address),
         },
       });
     }
 
     return {
       signals,
-      metrics: { smartWallets: smartWallets.length, marketsChecked: marketCounts.size, confluenceFound: signals.length },
+      metrics: {
+        smartWallets:    smartWallets.length,
+        marketsChecked:  marketCounts.size,
+        confluenceFound: signals.length,
+      },
     };
   },
 };

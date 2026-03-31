@@ -1,5 +1,17 @@
 /**
  * S4: Order Book Imbalance Detector
+ *
+ * Monitorea el CLOB de Polymarket y detecta cuando hay una asimetría
+ * grande entre bid depth y ask depth.
+ *
+ * Parámetros configurables:
+ *   intervalSeconds       — default 90
+ *   imbalanceThreshold    — ratio mínimo para alertar, 0-1 (default 0.70)
+ *                           > 0.70 = bid heavy | < 0.30 = ask heavy
+ *   depthLevels           — cuántos niveles del book considerar (default 5)
+ *   minMarketVolume24h    — volumen mínimo del mercado en USDC (default 2000)
+ *   maxMarketsPerRun      — mercados a analizar por tick (default 30)
+ *   cooldownMinutes       — cooldown por mercado/token/dirección (default 60)
  */
 
 import { Strategy, StrategyRunResult } from '../../core/strategy.interface';
@@ -43,7 +55,7 @@ export const orderBookStrategy: Strategy = {
   async run(params): Promise<StrategyRunResult> {
     const p         = params as unknown as OrderBookParams;
     const signals: StrategyRunResult['signals'] = [];
-    const cooldownMs = p.cooldownMinutes * 60_000;
+    const cooldownMs  = p.cooldownMinutes * 60_000;
     let booksChecked  = 0;
     let snapshotsSaved = 0;
 
@@ -73,11 +85,15 @@ export const orderBookStrategy: Strategy = {
         const spread  = bestBid && bestAsk
           ? (Number(bestAsk) - Number(bestBid)).toFixed(6) : null;
 
+        // Guardar snapshot para historial
         await orderBookQueries.insertSnapshot({
-          marketId: market.conditionId, tokenId: token.token_id,
-          bestBid: bestBid ?? undefined, bestAsk: bestAsk ?? undefined,
-          spread: spread ?? undefined,
-          bidDepth: bidDepth.toFixed(4), askDepth: askDepth.toFixed(4),
+          marketId:       market.conditionId,
+          tokenId:        token.token_id,
+          bestBid:        bestBid ?? undefined,
+          bestAsk:        bestAsk ?? undefined,
+          spread:         spread ?? undefined,
+          bidDepth:       bidDepth.toFixed(4),
+          askDepth:       askDepth.toFixed(4),
           imbalanceRatio: imbalanceRatio.toFixed(4),
         }).catch(() => {});
         snapshotsSaved++;
@@ -86,17 +102,24 @@ export const orderBookStrategy: Strategy = {
         const isAskHeavy = imbalanceRatio <= (1 - p.imbalanceThreshold);
         if (!isBidHeavy && !isAskHeavy) continue;
 
-        const key = `${market.conditionId}:${token.token_id}`;
+        const direction = isBidHeavy ? 'bid_heavy' : 'ask_heavy';
+
+        // Cooldown incluye la dirección: si cambia de bid_heavy a ask_heavy
+        // en la misma hora, SÍ alerta (son señales opuestas)
+        const key = `${market.conditionId}:${token.token_id}:${direction}`;
         if (!(await cooldown.isReady(key, cooldownMs))) continue;
 
-        const direction = isBidHeavy ? 'bid_heavy' : 'ask_heavy';
-        const emoji     = isBidHeavy ? '🟢' : '🔴';
-        const label     = isBidHeavy ? '⬆ Presión compradora' : '⬇ Presión vendedora';
+        const emoji = isBidHeavy ? '🟢' : '🔴';
+        const label = isBidHeavy ? '⬆ Presión compradora' : '⬇ Presión vendedora';
 
         await orderBookQueries.insertAlert({
-          marketId: market.conditionId, marketTitle: market.question,
-          tokenId: token.token_id, imbalanceRatio: imbalanceRatio.toFixed(4),
-          direction, bestBid: bestBid ?? undefined, bestAsk: bestAsk ?? undefined,
+          marketId:       market.conditionId,
+          marketTitle:    market.question,
+          tokenId:        token.token_id,
+          imbalanceRatio: imbalanceRatio.toFixed(4),
+          direction,
+          bestBid:        bestBid ?? undefined,
+          bestAsk:        bestAsk ?? undefined,
         }).catch(() => {});
 
         await cooldown.stamp(key);
@@ -116,24 +139,37 @@ export const orderBookStrategy: Strategy = {
             spread  ? `<b>Spread:</b>   ${spread}`  : '',
           ].filter(Boolean).join('\n'),
           metadata: {
-            marketId: market.conditionId, tokenId: token.token_id,
-            outcome: token.outcome, imbalanceRatio, direction,
-            bidDepth, askDepth, bestBid, bestAsk,
+            marketId:       market.conditionId,
+            tokenId:        token.token_id,
+            outcome:        token.outcome,
+            imbalanceRatio,
+            direction,
+            bidDepth,
+            askDepth,
+            bestBid,
+            bestAsk,
           },
         });
       }
     }
 
-    return { signals, metrics: { booksChecked, snapshotsSaved, signalsFired: signals.length } };
+    return {
+      signals,
+      metrics: { booksChecked, snapshotsSaved, signalsFired: signals.length },
+    };
   },
 
-  async init() { logger.info('[order_book] init'); },
+  async init() { logger.info('[order_book] init — will monitor CLOB imbalances'); },
 };
 
 async function fetchBook(clobBase: string, tokenId: string): Promise<ClobBook | null> {
   try {
-    const res = await fetch(`${clobBase}/book?token_id=${tokenId}`, { signal: AbortSignal.timeout(8_000) });
+    const res = await fetch(`${clobBase}/book?token_id=${tokenId}`, {
+      signal: AbortSignal.timeout(8_000),
+    });
     if (!res.ok) return null;
     return res.json() as Promise<ClobBook>;
-  } catch { return null; }
+  } catch {
+    return null;
+  }
 }

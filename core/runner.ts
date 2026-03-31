@@ -42,8 +42,7 @@ export async function startRunner() {
     }
 
     scheduleStrategy(strategy.id, params);
-
-}
+  }
 
   scheduleWalletSync();
   scheduleDailyReport();
@@ -68,7 +67,7 @@ export async function stopRunner() {
 
 function scheduleStrategy(strategyId: string, params: Record<string, unknown>) {
   const intervalSec = (params.intervalSeconds as number | undefined) ?? 60;
-  const strategy = STRATEGIES.find(s => s.id === strategyId);
+  const strategy    = STRATEGIES.find(s => s.id === strategyId);
   if (!strategy) return;
 
   // Ejecutar inmediatamente y luego cada intervalSec
@@ -125,7 +124,7 @@ async function runStrategy(strategyId: string, params: Record<string, unknown>) 
 function scheduleWalletSync(intervalHours = 8) {
   const intervalMs = (Number(process.env.WALLET_SYNC_INTERVAL_HOURS) || intervalHours) * 3_600_000;
 
-  // Correr inmediatamente al arrancar (en background, no bloquea)
+  // Correr inmediatamente al arrancar (en background, no bloquea el arranque)
   runWalletSync().catch(err => logger.error('wallet-sync initial run failed', err));
 
   // Luego cada N horas
@@ -174,22 +173,24 @@ function scheduleDailyReport() {
 }
 
 async function runDailyReport() {
-  const today = new Date().toISOString().slice(0, 10);
+  // yesterday en UTC para el upsert de stats diarias
   const yesterday = new Date(Date.now() - 86_400_000).toISOString().slice(0, 10);
-  const since = new Date(Date.now() - 86_400_000);
+  const since     = new Date(Date.now() - 86_400_000);
 
   const summaries: Array<{
-    strategyId:  string;
-    name:        string;
-    winRatePct:  number | null;
+    strategyId:   string;
+    name:         string;
+    winRatePct:   number | null;
     totalSignals: number;
-    pending:     number;
+    pending:      number;
   }> = [];
 
   for (const strategy of STRATEGIES) {
     const wr     = await signalQueries.getWinRate(strategy.id, since);
     const runSum = await runLogQueries.getSummary(strategy.id, 24);
 
+    // totalSignals = solo los resueltos (correct + incorrect + neutral)
+    // wr.resolved ya es correct + incorrect, agregamos neutral por separado
     const entry = {
       strategyId:   strategy.id,
       name:         strategy.name,
@@ -224,7 +225,7 @@ async function runDailyReport() {
 
 export async function enableStrategy(strategyId: string) {
   await strategyQueries.setEnabled(strategyId, true);
-  const config = await strategyQueries.getById(strategyId);
+  const config   = await strategyQueries.getById(strategyId);
   const strategy = STRATEGIES.find(s => s.id === strategyId);
   if (!strategy || !config) return;
 

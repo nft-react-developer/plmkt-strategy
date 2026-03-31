@@ -1,5 +1,17 @@
 /**
  * S1: Whale Tracker
+ *
+ * Sigue wallets con alto volumen y emite un signal cuando
+ * una wallet "top" abre una posición grande.
+ *
+ * Parámetros configurables (via DB strategy_config.params):
+ *   intervalSeconds    — cada cuánto corre (default 120)
+ *   topN               — cuántas wallets top trackear (default 30)
+ *   minWinRate         — win rate mínimo para considerar una wallet (default 0.60)
+ *   minTrades          — trades mínimos históricos (default 20)
+ *   alertThresholdUsdc — tamaño mínimo de trade para alertar (default 500)
+ *   cooldownMinutes    — cooldown por trade único (default 120)
+ *   maxTradeAgeMinutes — ignorar trades más viejos que esto (default 30)
  */
 
 import { Strategy, StrategyRunResult } from '../../core/strategy.interface';
@@ -14,6 +26,7 @@ interface WhaleParams {
   minTrades:            number;
   alertThresholdUsdc:   number;
   cooldownMinutes:      number;
+  maxTradeAgeMinutes:   number;
 }
 
 const cooldown = new CooldownManager('whale_tracker');
@@ -30,15 +43,20 @@ export const whaleTrackerStrategy: Strategy = {
     minTrades:          20,
     alertThresholdUsdc: 500,
     cooldownMinutes:    120,
+    maxTradeAgeMinutes: 30,  // solo alertar sobre trades de los últimos 30 minutos
   } satisfies WhaleParams,
 
   async run(params): Promise<StrategyRunResult> {
     const p          = params as unknown as WhaleParams;
     const signals: StrategyRunResult['signals'] = [];
-    const cooldownMs = p.cooldownMinutes * 60_000;
+    const cooldownMs     = p.cooldownMinutes * 60_000;
+    const maxAgeMs       = p.maxTradeAgeMinutes * 60_000;
+    const cutoffDate     = new Date(Date.now() - maxAgeMs);
 
     const topWallets = await walletQueries.getTopByScore(p.topN);
-    const qualified  = topWallets.filter(w =>
+
+    // Filtrar por win rate y trades mínimos
+    const qualified = topWallets.filter(w =>
       Number(w.winRatePct ?? 0) >= p.minWinRate * 100 &&
       w.totalTrades >= p.minTrades,
     );
@@ -51,9 +69,14 @@ export const whaleTrackerStrategy: Strategy = {
 
       const latest    = recentTrades[0];
       const usdcValue = Number(latest.usdcValue ?? 0);
+
+      // Ignorar trades viejos: evita re-alertar sobre operaciones antiguas
+      if (latest.tradedAt < cutoffDate) continue;
+
       if (usdcValue < p.alertThresholdUsdc) continue;
 
-      // Key incluye el txHash para que cada trade único solo alerte una vez
+      // Key por txHash: cada trade único solo alerta una vez,
+      // independientemente del cooldown en minutos
       const key = `${wallet.address}:${latest.txHash ?? latest.tradedAt.toISOString()}`;
       if (!(await cooldown.isReady(key, cooldownMs))) continue;
 
@@ -75,13 +98,23 @@ export const whaleTrackerStrategy: Strategy = {
           `<b>Tamaño:</b> $${usdcValue.toFixed(2)} USDC`,
         ].join('\n'),
         metadata: {
-          walletAddress: wallet.address, marketId: latest.marketId,
-          side: latest.side, price: latest.price, usdcValue, txHash: latest.txHash,
+          walletAddress: wallet.address,
+          marketId:      latest.marketId,
+          side:          latest.side,
+          price:         latest.price,
+          usdcValue,
+          txHash:        latest.txHash,
         },
       });
     }
 
-    return { signals, metrics: { walletsChecked: qualified.length, signalsFired: signals.length } };
+    return {
+      signals,
+      metrics: {
+        walletsChecked: qualified.length,
+        signalsFired:   signals.length,
+      },
+    };
   },
 
   async init(params) {

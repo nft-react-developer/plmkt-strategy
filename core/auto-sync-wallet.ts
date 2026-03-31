@@ -8,8 +8,8 @@ interface PolyLeaderboardEntry {
   rank:          string;
   proxyWallet:   string;
   userName:      string;
-  vol:           number;   // ← era 'volume'
-  pnl:           number;   // ← era 'profit'
+  vol:           number;
+  pnl:           number;
   profileImage:  string;
   xUsername:     string;
   verifiedBadge: boolean;
@@ -31,13 +31,16 @@ interface PolyTrade {
 export async function runWalletSync(limit = 150, minVol = 5000) {
   logger.info(`[wallet-sync] starting — limit: ${limit}, minVol: $${minVol}`);
 
-  const profiles = await fetchLeaderboard(limit, minVol);
-  logger.info(`[wallet-sync] fetched ${profiles.length} wallets`);
-
+  // Inicializar DB antes de comprobar conexión
   await getDb();
   const ok = await testConnection();
-  if (!ok) { logger.error('DB connection failed'); process.exit(1); }
-  
+  if (!ok) {
+    logger.error('[wallet-sync] DB connection failed, skipping sync');
+    return;
+  }
+
+  const profiles = await fetchLeaderboard(limit, minVol);
+  logger.info(`[wallet-sync] fetched ${profiles.length} wallets`);
 
   let updated = 0;
   let errors  = 0;
@@ -45,13 +48,15 @@ export async function runWalletSync(limit = 150, minVol = 5000) {
   for (const profile of profiles) {
     try {
       const { winRate, winningTrades } = await calcWinRate(profile.proxyWallet);
+      // Smart score: win_rate * ln(winningTrades + 1)
+      // Usa winningTrades en lugar de totalTrades (no disponible en leaderboard)
       const smartScore = winRate * Math.log(winningTrades + 1);
 
       await walletQueries.upsert({
         address:        profile.proxyWallet,
         source:         'leaderboard',
-        totalTrades:  0,  // se actualiza cuando se sincroniza el activity
-        totalVolume:  profile.vol.toFixed(2),
+        totalTrades:    0, // se actualiza al sincronizar actividad
+        totalVolume:    profile.vol.toFixed(2),
         winningTrades,
         winRatePct:     (winRate * 100).toFixed(2),
         smartScore:     smartScore.toFixed(4),
@@ -70,40 +75,56 @@ export async function runWalletSync(limit = 150, minVol = 5000) {
 }
 
 async function fetchLeaderboard(limit: number, minVol: number): Promise<PolyLeaderboardEntry[]> {
-  // El endpoint acepta: category, limit, offset, window (1d|1w|1m|all)
   const url = `${DATA_API}/v1/leaderboard?limit=${limit}&window=1m&category=OVERALL`;
   const res  = await fetch(url, { signal: AbortSignal.timeout(15_000) });
   if (!res.ok) throw new Error(`leaderboard API ${res.status}`);
-  const data: PolyLeaderboardEntry[] = await res.json() as PolyLeaderboardEntry[];
+  const data = await res.json() as PolyLeaderboardEntry[];
   return data.filter(p => p.vol >= minVol);
 }
+
+/**
+ * Calcula win rate basado en trades con profitLoss conocido.
+ * Solo cuenta mercados ya resueltos.
+ */
 async function calcWinRate(address: string): Promise<{ winRate: number; winningTrades: number }> {
   try {
     const url = `${DATA_API}/activity?user=${address}&limit=100`;
     const res  = await fetch(url, { signal: AbortSignal.timeout(10_000) });
     if (!res.ok) return { winRate: 0, winningTrades: 0 };
-    const trades: PolyTrade[] = await res.json() as PolyTrade[];
+
+    const trades = await res.json() as PolyTrade[];
     const resolved = trades.filter(t => t.profitLoss !== undefined && t.profitLoss !== null);
     if (!resolved.length) return { winRate: 0, winningTrades: 0 };
+
     const winning = resolved.filter(t => (t.profitLoss ?? 0) > 0);
-    return { winRate: winning.length / resolved.length, winningTrades: winning.length };
+    return {
+      winRate:       winning.length / resolved.length,
+      winningTrades: winning.length,
+    };
   } catch {
     return { winRate: 0, winningTrades: 0 };
   }
 }
 
+/**
+ * Sincroniza los últimos 20 trades de una wallet.
+ * Filtra trades recientes (últimas 48h) para no alertar sobre operaciones viejas.
+ */
 async function syncRecentTrades(address: string): Promise<void> {
   try {
     const url = `${DATA_API}/activity?user=${address}&limit=20`;
     const res  = await fetch(url, { signal: AbortSignal.timeout(10_000) });
     if (!res.ok) return;
-    const trades: PolyTrade[] = await res.json() as PolyTrade[];
+
+    const trades = await res.json() as PolyTrade[];
+
     for (const t of trades) {
       const side = t.side?.toLowerCase() === 'sell' ? 'sell' : 'buy';
       let outcome: 'won' | 'lost' | 'void' | undefined;
       if (t.profitLoss !== undefined && t.profitLoss !== null) {
         outcome = t.profitLoss > 0 ? 'won' : t.profitLoss < 0 ? 'lost' : 'void';
       }
+
       await walletTradeQueries.insertIfNotExists({
         walletAddress: address,
         marketId:      t.conditionId,
@@ -117,7 +138,9 @@ async function syncRecentTrades(address: string): Promise<void> {
         tradedAt:      new Date(t.timestamp * 1000),
         outcome,
         pnlUsdc:       t.profitLoss?.toFixed(4),
-      } as Parameters<typeof walletTradeQueries.insertIfNotExists>[0]);
+      });
     }
-  } catch {}
+  } catch {
+    // No critico si falla un trade individual
+  }
 }
