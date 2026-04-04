@@ -4,15 +4,15 @@ import { smartMoneyStrategy }   from './smart-money/index';
 import { oddsMoverStrategy }    from './odds-mover/index';
 import { orderBookStrategy }    from './order-book/index';
 import { resolutionArbStrategy } from './resolution-arb';
-import { rewardsHunterStrategy } from './reward-hunter';
+import { rewardsExecutorStrategy } from './reward-executor';
 
 export const STRATEGIES: Strategy[] = [
-  whaleTrackerStrategy,
-  smartMoneyStrategy,
-  oddsMoverStrategy,
-  orderBookStrategy,
-  resolutionArbStrategy,
-  rewardsHunterStrategy
+  // whaleTrackerStrategy,
+  // smartMoneyStrategy,
+  // oddsMoverStrategy,
+  // orderBookStrategy,
+  // resolutionArbStrategy,
+  rewardsExecutorStrategy,
   // ← nuevas estrategias acá
 ];
 

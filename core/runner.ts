@@ -103,7 +103,7 @@ async function runStrategy(strategyId: string, params: Record<string, unknown>) 
 
   } catch (err) {
     error = err instanceof Error ? err.message : String(err);
-    logger.error(`[${strategyId}] run error: ${error}`);
+    logger.error(`[${strategyId}] run error: ${error}`), err;
   }
 
   const durationMs = Date.now() - t0;

@@ -192,6 +192,116 @@ ${list}
 
     await send(msg);
   },
+
+
+  /**
+   * Reporte diario de PnL del rewards executor.
+   * Se llama a las 00:00 UTC (mismo momento que Polymarket paga rewards).
+   */
+  async sendRewardsExecutorReport(data: {
+    date:         string;   // YYYY-MM-DD
+    paperTrading: boolean;
+ 
+    // Posiciones
+    positionsOpen:   number;
+    positionsOpened: number;  // abiertas hoy
+    positionsClosed: number;  // cerradas hoy
+ 
+    // PnL del día
+    rewardsEarnedUsdc: number;
+    feesPaidUsdc:      number;
+    netPnlUsdc:        number;
+ 
+    // Calidad
+    avgTimeInRangePct: number | null;
+    avgQmin:           number | null;
+ 
+    // Motivos de cierre del día
+    closedRewardEnded:  number;
+    closedScoreTooLow:  number;
+    closedPriceMoved:   number;
+    closedExpired:      number;
+ 
+    // Posiciones abiertas actualmente (top 5 por rewards)
+    topPositions: Array<{
+      marketQuestion:    string;
+      rewardsEarnedUsdc: number;
+      feesPaidUsdc:      number;
+      inRangePct:        number;
+      daysOpen:          number;
+      dailyRewardUsdc:   number;
+    }>;
+  }) {
+    const mode     = data.paperTrading ? '📋 PAPER TRADING' : '💵 REAL TRADING';
+    const netIcon  = data.netPnlUsdc >= 0 ? '🟢' : '🔴';
+    const netSign  = data.netPnlUsdc >= 0 ? '+' : '';
+ 
+    // ── Header ────────────────────────────────────────────────────────────
+    const header = [
+      `💰 <b>Rewards Executor — Daily Report</b>`,
+      `📅 ${data.date}  |  ${mode}`,
+    ].join('\n');
+ 
+    // ── PnL del día ───────────────────────────────────────────────────────
+    const pnlBar  = buildMiniBar(
+      data.rewardsEarnedUsdc > 0
+        ? (data.netPnlUsdc / data.rewardsEarnedUsdc) * 100
+        : null,
+    );
+    const pnlSection = [
+      '',
+      `${netIcon} <b>PnL del día</b>`,
+      `  Rewards ganados:  <b>$${data.rewardsEarnedUsdc.toFixed(4)}</b>`,
+      `  Fees pagadas:    -$${data.feesPaidUsdc.toFixed(4)}`,
+      `  Net:              <b>${netSign}$${data.netPnlUsdc.toFixed(4)}</b>  ${pnlBar}`,
+    ].join('\n');
+ 
+    // ── Calidad del scoring ───────────────────────────────────────────────
+    const qualitySection = [
+      '',
+      `📐 <b>Calidad</b>`,
+      `  % tiempo en rango: ${data.avgTimeInRangePct !== null ? `${data.avgTimeInRangePct.toFixed(1)}%` : 'N/A'}  ${buildMiniBar(data.avgTimeInRangePct)}`,
+      `  Qmin promedio:     ${data.avgQmin !== null ? data.avgQmin.toFixed(4) : 'N/A'}`,
+    ].join('\n');
+ 
+    // ── Actividad ─────────────────────────────────────────────────────────
+    const closedDetail = [
+      data.closedRewardEnded  > 0 ? `⏰ reward expirado: ${data.closedRewardEnded}`   : '',
+      data.closedScoreTooLow  > 0 ? `📉 score bajo: ${data.closedScoreTooLow}`        : '',
+      data.closedPriceMoved   > 0 ? `⚠️ precio movido: ${data.closedPriceMoved}`      : '',
+      data.closedExpired      > 0 ? `🕐 expiradas: ${data.closedExpired}`             : '',
+    ].filter(Boolean).join('  ');
+ 
+    const activitySection = [
+      '',
+      `📊 <b>Actividad</b>`,
+      `  Posiciones abiertas: <b>${data.positionsOpen}</b>`,
+      `  Abiertas hoy:        ${data.positionsOpened}`,
+      `  Cerradas hoy:        ${data.positionsClosed}${closedDetail ? `  (${closedDetail})` : ''}`,
+    ].join('\n');
+ 
+    // ── Top posiciones abiertas ───────────────────────────────────────────
+    let topSection = '';
+    if (data.topPositions.length > 0) {
+      const rows = data.topPositions.map((p, i) => {
+        const net     = p.rewardsEarnedUsdc - p.feesPaidUsdc;
+        const netSign = net >= 0 ? '+' : '';
+        const bar     = buildMiniBar(p.inRangePct);
+        return [
+          `  ${i + 1}. <b>${p.marketQuestion.slice(0, 45)}</b>`,
+          `     ${bar} ${p.inRangePct.toFixed(0)}% en rango | net: ${netSign}$${net.toFixed(4)} | pool: $${p.dailyRewardUsdc.toFixed(0)}/día | ${p.daysOpen.toFixed(1)}d`,
+        ].join('\n');
+      });
+      topSection = ['', `🏆 <b>Top posiciones (por rewards)</b>`, ...rows].join('\n');
+    }
+ 
+    const msg = [header, pnlSection, qualitySection, activitySection, topSection]
+      .filter(Boolean)
+      .join('\n');
+ 
+    await send(msg);
+  },
+ 
 };
 
 // ─── Helper (fuera del objeto, añadir al final del archivo) ──────────────────
