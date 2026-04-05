@@ -125,48 +125,70 @@ export function calcMidprice(bestBid: number | null, bestAsk: number | null): nu
   return null;
 }
 
+// Estrategia de colocacion de ordenes:
+//   tight — 1c del mid (max score, mas riesgo de fill)
+//   mid   — mitad del maxSpread (balance score/riesgo) <- recomendada
+//   wide  — cerca del maxSpread (min fill risk, menor score)
+export type PlacementStrategy = 'tight' | 'mid' | 'wide';
+
 /**
- * Dado un capital en USDC y un precio, calcula cuántas shares comprar
- * y a qué precio colocar bid/ask dentro del maxSpread.
+ * Calcula los precios de las ordenes bid/ask segun la estrategia de colocacion.
  *
- * Coloca las órdenes lo más cerca posible del midpoint
- * (a 1 centavo dentro del límite para maximizar el score cuadrático).
+ * tight: 1c del mid — maximiza score cuadratico, mas expuesto a fills
+ * mid:   mitad del maxSpread — balance entre score y seguridad
+ * wide:  80% del maxSpread — minimo riesgo de fill, menor score
  */
 export function calcOrderPrices(
-  midprice:       number,
-  maxSpreadCents: number,
-  sizePerSideUsdc: number,
-  dualSideRequired: boolean,
+  midprice:          number,
+  maxSpreadCents:    number,
+  sizePerSideUsdc:   number,
+  dualSideRequired:  boolean,
+  placement:         PlacementStrategy = 'mid',
 ): Array<{ side: 'buy' | 'sell'; price: number; sizeUsdc: number; sizeShares: number; spreadFromMidCents: number }> {
-  // Colocar a 1 centavo del midpoint (máximo score posible)
-  // Nunca superar maxSpreadCents - 0.5 para tener margen
-  const targetSpreadCents = Math.min(1.0, maxSpreadCents - 0.5);
-  const targetSpread      = targetSpreadCents / 100;
+
+  // Calcular distancia al mid segun estrategia
+  let targetSpreadCents: number;
+  switch (placement) {
+    case 'tight':
+      // 1c del mid — nunca superar maxSpread - 0.5 para no salirse del rango
+      targetSpreadCents = Math.min(1.0, maxSpreadCents - 0.5);
+      break;
+    case 'mid':
+      // Mitad del maxSpread — estrategia recomendada para evitar fills
+      targetSpreadCents = maxSpreadCents / 2;
+      break;
+    case 'wide':
+      // 80% del maxSpread — maximo alejamiento del mid dentro del rango
+      targetSpreadCents = maxSpreadCents * 0.80;
+      break;
+    default:
+      targetSpreadCents = maxSpreadCents / 2;
+  }
+
+  // Asegurar que siempre queda dentro del rango valido
+  targetSpreadCents = Math.max(0.5, Math.min(targetSpreadCents, maxSpreadCents - 0.5));
+  const targetSpread = targetSpreadCents / 100;
 
   const bidPrice = Math.max(0.01, midprice - targetSpread);
   const askPrice = Math.min(0.99, midprice + targetSpread);
 
-  const result = [];
-
-  // Siempre colocamos bid en YES
   const bidShares = sizePerSideUsdc / bidPrice;
-  result.push({
-    side:               'buy' as const,
-    price:              bidPrice,
-    sizeUsdc:           sizePerSideUsdc,
-    sizeShares:         bidShares,
-    spreadFromMidCents: targetSpreadCents,
-  });
-
-  // Ask en YES — siempre (incluso si no es dual side, suma al score)
   const askShares = sizePerSideUsdc / askPrice;
-  result.push({
-    side:               'sell' as const,
-    price:              askPrice,
-    sizeUsdc:           sizePerSideUsdc,
-    sizeShares:         askShares,
-    spreadFromMidCents: targetSpreadCents,
-  });
 
-  return result;
+  return [
+    {
+      side:               'buy' as const,
+      price:              bidPrice,
+      sizeUsdc:           sizePerSideUsdc,
+      sizeShares:         bidShares,
+      spreadFromMidCents: targetSpreadCents,
+    },
+    {
+      side:               'sell' as const,
+      price:              askPrice,
+      sizeUsdc:           sizePerSideUsdc,
+      sizeShares:         askShares,
+      spreadFromMidCents: targetSpreadCents,
+    },
+  ];
 }

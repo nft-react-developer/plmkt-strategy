@@ -211,3 +211,104 @@ export async function repriceIfNeeded(
 export function clearRepriceTracker(positionId: number): void {
   repriceCount.delete(positionId);
 }
+
+// ---- Re-queue FIFO ----------------------------------------------------------
+
+const requeueTimestamps = new Map<number, number>();
+
+export interface RequeueResult {
+  action:  'requeued' | 'skipped' | 'error';
+  reason?: string;
+}
+
+/**
+ * Re-queue FIFO: cancela y repone las ordenes en el MISMO precio
+ * para subir al tope de la cola de ejecucion.
+ *
+ * El CLOB de Polymarket es FIFO — al cancelar y reponer quedas al
+ * final de la cola de ese precio, pero si sos el unico en ese tick
+ * quedas primero.
+ *
+ * Solo corre si NO hubo reprecio en este tick (no tiene sentido hacer los dos).
+ */
+export async function requeueIfNeeded(
+  positionId:       number,
+  tokenIdYes:       string,
+  maxSpreadCents:   number,
+  sizePerSideUsdc:  number,
+  dualSideRequired: boolean,
+  currentMidprice:  number,
+  params: {
+    requeueIntervalMinutes: number;
+    paperTrading:           boolean;
+  },
+): Promise<RequeueResult> {
+  const intervalMs  = params.requeueIntervalMinutes * 60_000;
+  const lastRequeue = requeueTimestamps.get(positionId) ?? 0;
+  const now         = Date.now();
+
+  if (now - lastRequeue < intervalMs) {
+    const nextIn = Math.ceil((lastRequeue + intervalMs - now) / 60_000);
+    return { action: 'skipped', reason: `proximo re-queue en ${nextIn}min` };
+  }
+
+  logger.info(`[order-replacer] Re-queue FIFO #${positionId} | mid=${(currentMidprice * 100).toFixed(1)}c`);
+
+  const newOrders = calcOrderPrices(currentMidprice, maxSpreadCents, sizePerSideUsdc, dualSideRequired);
+
+  if (params.paperTrading) {
+    await orderQueries.insertMany(
+      newOrders.map(o => ({
+        positionId,
+        paperTrading:       true,
+        tokenId:            tokenIdYes,
+        side:               o.side,
+        price:              o.price,
+        sizeUsdc:           o.sizeUsdc,
+        sizeShares:         o.sizeShares,
+        spreadFromMidCents: o.spreadFromMidCents,
+      })),
+    );
+    requeueTimestamps.set(positionId, now);
+    const bid = newOrders.find(o => o.side === 'buy');
+    const ask = newOrders.find(o => o.side === 'sell');
+    console.log(`[order-replacer] Re-queue PAPER #${positionId} | bid=${bid ? (bid.price * 100).toFixed(1) : '?'}c ask=${ask ? (ask.price * 100).toFixed(1) : '?'}c`);
+    return { action: 'requeued' };
+  }
+
+  try {
+    await cancelAllForMarket(tokenIdYes);
+    for (const o of newOrders) {
+      const posted = await postOrder({
+        tokenId: tokenIdYes,
+        price:   o.price,
+        size:    o.sizeShares,
+        side:    o.side === 'buy' ? 'BUY' : 'SELL',
+      });
+      await orderQueries.insertMany([{
+        positionId,
+        paperTrading:       false,
+        tokenId:            tokenIdYes,
+        side:               o.side,
+        price:              o.price,
+        sizeUsdc:           o.sizeUsdc,
+        sizeShares:         o.sizeShares,
+        spreadFromMidCents: o.spreadFromMidCents,
+      }]);
+      logger.info(`[order-replacer] Re-queue REAL ${o.side} @ ${o.price.toFixed(4)} | id: ${posted.orderId}`);
+    }
+    requeueTimestamps.set(positionId, now);
+    console.log(`[order-replacer] Re-queue REAL #${positionId} completado`);
+    return { action: 'requeued' };
+  } catch (err) {
+    logger.error('[order-replacer] Error en re-queue', err);
+    return { action: 'error', reason: String(err) };
+  }
+}
+
+/**
+ * Reset del tracker de re-queue (al cerrar una posicion).
+ */
+export function clearRequeueTracker(positionId: number): void {
+  requeueTimestamps.delete(positionId);
+}

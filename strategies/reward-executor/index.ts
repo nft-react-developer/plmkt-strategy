@@ -30,8 +30,8 @@ import { calcSampleScore, calcMidprice, calcOrderPrices, ScoredOrder } from '../
 import { positionQueries, orderQueries, accrualQueries } from '../../db/queries-paper';
 import { calcTakerFee, parseCategory } from '../../utils/fees';
 import { logger } from '../../utils/logger';
-import { syncInventory, rebalanceIfNeeded, closeInventoryPosition, clearRepriceTracker } from '../../core/inventory-manager';
-import { repriceIfNeeded } from '../../core/order-replacer';
+import { syncInventory, rebalanceIfNeeded, closeInventoryPosition } from '../../core/inventory-manager';
+import { repriceIfNeeded, clearRepriceTracker } from '../../core/order-replacer';
 import { postOrder, cancelAllForMarket, verifyAuth } from '../../core/clob-client';
 
 // ---- Tipos del CLOB API /rewards/markets/multi ------------------------------
