@@ -4,6 +4,7 @@ import { startRunner, stopRunner, getActiveStrategies } from './core/runner';
 import { testConnection, closeDb, getDb } from './db/connection';
 import { telegram } from './telegram/notifier';
 import { logger } from './utils/logger';
+import { startCommandListener } from './telegram/commands';
 
 async function main() {
   logger.info('🔄 Connecting to database...');
@@ -16,6 +17,7 @@ async function main() {
   logger.info('✅ Database connected');
 
   await startRunner();
+  startCommandListener();
 
   const active = getActiveStrategies();
   await telegram.sendStartup(active);

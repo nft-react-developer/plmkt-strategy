@@ -30,6 +30,9 @@ import { calcSampleScore, calcMidprice, calcOrderPrices, ScoredOrder } from '../
 import { positionQueries, orderQueries, accrualQueries } from '../../db/queries-paper';
 import { calcTakerFee, parseCategory } from '../../utils/fees';
 import { logger } from '../../utils/logger';
+import { syncInventory, rebalanceIfNeeded, closeInventoryPosition, clearRepriceTracker } from '../../core/inventory-manager';
+import { repriceIfNeeded } from '../../core/order-replacer';
+import { postOrder, cancelAllForMarket, verifyAuth } from '../../core/clob-client';
 
 // ---- Tipos del CLOB API /rewards/markets/multi ------------------------------
 
@@ -173,6 +176,37 @@ export const rewardsExecutorStrategy: Strategy = {
       await positionQueries.addReward(pos.id, score.rewardUsdc, score.qmin, score.inRange);
       totalRewardUsdc += score.rewardUsdc;
 
+      // ---- Real trading: sync inventario y reprecio -----------------------
+      if (!p.paperTrading) {
+        // 1. Sincronizar inventario con el CLOB real
+        const inventory = await syncInventory(
+          pos.id, pos.tokenIdYes, pos.tokenIdNo, midprice,
+          { maxInventoryValueUsdc: p.sizeUsdcPerPosition * 2 },
+        ).catch(err => { logger.error('[rewards_executor] syncInventory failed', err); return null; });
+
+        // 2. Reequilibrar si la exposicion supera el umbral
+        if (inventory && Math.abs(inventory.netExposure) > 0) {
+          const rebalance = await rebalanceIfNeeded(
+            inventory, midprice, Number(pos.maxSpreadCents),
+          ).catch(() => 'error' as const);
+          if (rebalance === 'rebalanced') {
+            console.log(`[rewards_executor]   REBALANCE #${pos.id} | net=${inventory.netExposure.toFixed(2)} shares`);
+          }
+        }
+
+        // 3. Repreciar si el mid se movio demasiado
+        const reprice = await repriceIfNeeded(
+          pos.id, pos.tokenIdYes, midprice,
+          Number(pos.maxSpreadCents), Number(pos.sizePerSideUsdc),
+          pos.dualSideRequired ?? false,
+          { paperTrading: false, repricingThresholdCents: 1.5 },
+        ).catch((err: any) => { logger.error('[rewards_executor] reprice failed', err); return null; });
+
+        if (reprice?.action === 'repriced') {
+          console.log(`[rewards_executor]   REPRICED #${pos.id} | ${(reprice.oldMidprice! * 100).toFixed(1)}c -> ${(reprice.newMidprice! * 100).toFixed(1)}c | fee=$${reprice.feesPaid?.toFixed(4)}`);
+        }
+      }
+
       const icon = score.inRange ? 'OK' : 'OUT';
       console.log(
         `[rewards_executor]   [${icon}] #${pos.id}` +
@@ -187,6 +221,7 @@ export const rewardsExecutorStrategy: Strategy = {
       if (new Date() > new Date(pos.rewardEndDate)) {
         console.log(`[rewards_executor]   #${pos.id} CERRADA: reward expirado`);
         await positionQueries.close(pos.id, 'reward_ended');
+        if (!p.paperTrading) await closeRealPosition(pos.id, pos.tokenIdYes, midprice);
         positionsClosed++;
         signals.push(buildCloseSignal(pos, 'reward_ended', midprice, score));
         continue;
@@ -195,6 +230,7 @@ export const rewardsExecutorStrategy: Strategy = {
       if (!score.inRange && score.qmin < p.minScoreThreshold) {
         console.log(`[rewards_executor]   #${pos.id} CERRADA: score_too_low Qmin=${score.qmin.toFixed(6)}`);
         await positionQueries.close(pos.id, 'score_too_low');
+        if (!p.paperTrading) await closeRealPosition(pos.id, pos.tokenIdYes, midprice);
         positionsClosed++;
         signals.push(buildCloseSignal(pos, 'score_too_low', midprice, score));
         continue;
@@ -205,6 +241,7 @@ export const rewardsExecutorStrategy: Strategy = {
       if (priceMoved > p.maxPriceMoveThreshold) {
         console.log(`[rewards_executor]   #${pos.id} CERRADA: price_moved ${(priceMoved * 100).toFixed(1)}%`);
         await positionQueries.close(pos.id, 'price_moved');
+        if (!p.paperTrading) await closeRealPosition(pos.id, pos.tokenIdYes, midprice);
         positionsClosed++;
         signals.push(buildCloseSignal(pos, 'price_moved', midprice, score));
         continue;
@@ -214,6 +251,7 @@ export const rewardsExecutorStrategy: Strategy = {
       if (daysOpen > p.maxDaysOpen) {
         console.log(`[rewards_executor]   #${pos.id} CERRADA: expired ${daysOpen.toFixed(1)}d`);
         await positionQueries.close(pos.id, 'expired');
+        if (!p.paperTrading) await closeRealPosition(pos.id, pos.tokenIdYes, midprice);
         positionsClosed++;
         signals.push(buildCloseSignal(pos, 'expired', midprice, score));
         continue;
@@ -381,10 +419,35 @@ export const rewardsExecutorStrategy: Strategy = {
       ` | maxPositions: ${p.maxPositions} | sizeUsdc: $${p.sizeUsdcPerPosition}` +
       ` | minRatePerDay: $${p.minRatePerDay}`,
     );
+    // En real trading verificar auth al arrancar
+    if (!p.paperTrading) {
+      const ok = await verifyAuth();
+      if (!ok) {
+        logger.error('[rewards_executor] Auth fallida. Verificar POLY_API_KEY / POLY_API_SECRET / POLY_API_PASSPHRASE');
+        throw new Error('CLOB auth failed — rewards_executor no puede arrancar en modo REAL');
+      }
+      logger.info('[rewards_executor] Auth CLOB verificada correctamente');
+    }
   },
 };
 
 // ---- Helpers -----------------------------------------------------------------
+
+async function closeRealPosition(positionId: number, tokenIdYes: string, midprice: number): Promise<void> {
+  try {
+    const inventory = require('../../core/inventory-manager').getInventoryState(tokenIdYes);
+    if (inventory) {
+      await closeInventoryPosition(inventory, midprice);
+    } else {
+      // Si no hay inventario en memoria, cancelar ordenes del mercado directamente
+      await cancelAllForMarket(tokenIdYes);
+    }
+    clearRepriceTracker(positionId);
+    logger.info(`[rewards_executor] Posicion real #${positionId} cerrada correctamente`);
+  } catch (err) {
+    logger.error(`[rewards_executor] Error cerrando posicion real #${positionId}`, err);
+  }
+}
 
 function buildCloseSignal(
   pos: Awaited<ReturnType<typeof positionQueries.getById>>,
