@@ -19,6 +19,7 @@ export const positionQueries = {
     marketId:            string;
     marketQuestion?:     string;
     marketSlug?:         string;
+    eventSlug?:          string;
     tokenIdYes:          string;
     tokenIdNo?:          string;
     rewardId:            string;
@@ -37,11 +38,12 @@ export const positionQueries = {
     totalLiquidityUsdc?: number;
   }): Promise<number> {
     const db = await getDb();
-    const result = await db!.insert(positions).values({
+    const result = await db.insert(positions).values({
       paperTrading:       data.paperTrading,
       marketId:           data.marketId,
       marketQuestion:     data.marketQuestion,
       marketSlug:         data.marketSlug,
+      eventSlug:          data.eventSlug,
       tokenIdYes:         data.tokenIdYes,
       tokenIdNo:          data.tokenIdNo,
       rewardId:           data.rewardId,
@@ -74,7 +76,7 @@ export const positionQueries = {
     const rewards = Number(pos.rewardsEarnedUsdc ?? 0);
     const fees    = Number(pos.feesPaidUsdc ?? 0);
 
-    await db!
+    await db
       .update(positions)
       .set({
         status:      'closed',
@@ -87,7 +89,7 @@ export const positionQueries = {
 
   async addReward(positionId: number, rewardUsdc: number, qmin: number, inRange: boolean): Promise<void> {
     const db = await getDb();
-    await db!
+    await db
       .update(positions)
       .set({
         rewardsEarnedUsdc: sql`rewards_earned_usdc + ${rewardUsdc.toFixed(6)}`,
@@ -101,7 +103,7 @@ export const positionQueries = {
 
   async addFee(positionId: number, feeUsdc: number): Promise<void> {
     const db = await getDb();
-    await db!
+    await db
       .update(positions)
       .set({ feesPaidUsdc: sql`fees_paid_usdc + ${feeUsdc.toFixed(6)}` })
       .where(eq(positions.id, positionId));
@@ -109,7 +111,7 @@ export const positionQueries = {
 
   async getById(id: number) {
     const db   = await getDb();
-    const rows = await db!.select().from(positions).where(eq(positions.id, id)).limit(1);
+    const rows = await db.select().from(positions).where(eq(positions.id, id)).limit(1);
     return rows[0] ?? null;
   },
 
@@ -118,13 +120,13 @@ export const positionQueries = {
     const where = paperTrading !== undefined
       ? and(eq(positions.status, 'open'), eq(positions.paperTrading, paperTrading))
       : eq(positions.status, 'open');
-    return db!.select().from(positions).where(where).orderBy(desc(positions.openedAt));
+    return db.select().from(positions).where(where).orderBy(desc(positions.openedAt));
   },
 
   /** ¿Ya tenemos una posición abierta en este mercado+modo? */
   async hasOpen(marketId: string, paperTrading: boolean): Promise<boolean> {
     const db   = await getDb();
-    const rows = await db!
+    const rows = await db
       .select({ id: positions.id })
       .from(positions)
       .where(and(
@@ -138,7 +140,7 @@ export const positionQueries = {
 
   async getRecent(paperTrading: boolean, limit = 20) {
     const db = await getDb();
-    return db!
+    return db
       .select()
       .from(positions)
       .where(eq(positions.paperTrading, paperTrading))
@@ -164,7 +166,7 @@ export const orderQueries = {
     spreadFromMidCents?: number;
   }>): Promise<void> {
     const db = await getDb();
-    await db!.insert(orders).values(
+    await db.insert(orders).values(
       items.map(o => ({
         positionId:         o.positionId,
         paperTrading:       o.paperTrading,
@@ -181,7 +183,7 @@ export const orderQueries = {
 
   async getForPosition(positionId: number) {
     const db = await getDb();
-    return db!
+    return db
       .select()
       .from(orders)
       .where(eq(orders.positionId, positionId))
@@ -211,7 +213,7 @@ export const accrualQueries = {
     inRange:         boolean;
   }): Promise<void> {
     const db = await getDb();
-    await db!.insert(rewardAccruals).values({
+    await db.insert(rewardAccruals).values({
       positionId:      data.positionId,
       paperTrading:    data.paperTrading,
       midprice:        data.midprice.toFixed(6),
@@ -231,7 +233,7 @@ export const accrualQueries = {
   /** Últimas N muestras de una posición — para debugging */
   async getRecent(positionId: number, limit = 60) {
     const db = await getDb();
-    return db!
+    return db
       .select()
       .from(rewardAccruals)
       .where(eq(rewardAccruals.positionId, positionId))
@@ -265,7 +267,7 @@ export const dailyPnlQueries = {
     closedManual:         number;
   }): Promise<void> {
     const db = await getDb();
-    await db!
+    await db
       .insert(dailyPnl)
       .values({
         paperTrading:         data.paperTrading,
@@ -311,7 +313,7 @@ export const dailyPnlQueries = {
     const where = paperTrading !== undefined
       ? and(eq(dailyPnl.paperTrading, paperTrading), gte(dailyPnl.date, since))
       : gte(dailyPnl.date, since);
-    return db!
+    return db
       .select()
       .from(dailyPnl)
       .where(where)

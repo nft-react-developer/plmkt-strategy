@@ -5,6 +5,7 @@
     "build": "tsc",
     "migrate": "tsx scripts/migrate.ts",
     "sync-wallets": "tsx scripts/sync-wallets.ts",
+    "update-markets": "tsx scripts/update-markets.ts",
     "cli": "tsx scripts/cli.ts"
   },
   "dependencies": {

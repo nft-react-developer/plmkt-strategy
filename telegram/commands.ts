@@ -118,8 +118,12 @@ async function handleCurrentRewards(chatId: string): Promise<void> {
       const question   = (p.marketQuestion ?? p.marketId).slice(0, 38);
       const bar        = buildBar(inRangePct);
 
-      const slug = (p as any).marketSlug ?? p.marketId;
-      const link = `<a href="https://polymarket.com/event/${slug}">${question}</a>`;
+      const ms   = (p as any).marketSlug;
+      const es   = (p as any).eventSlug;
+      const url  = ms && es ? `https://polymarket.com/event/${es}/${ms}`
+                 : ms       ? `https://polymarket.com/event/${ms}`
+                 : null;
+      const link = url ? `<a href="${url}">${question}</a>` : `<b>${question}</b>`;
 
       return [
         `  <b>${i + 1}. ${link}</b>`,
@@ -155,7 +159,7 @@ async function handleCurrentRewards(chatId: string): Promise<void> {
 async function handlePositions(chatId: string): Promise<void> {
   const db = await getDb();
 
-  const allOpen = await db!
+  const allOpen = await db
     .select()
     .from(positions)
     .where(eq(positions.status, 'open'))
@@ -176,8 +180,12 @@ async function handlePositions(chatId: string): Promise<void> {
     const daysOpen   = ((Date.now() - (p.openedAt?.getTime() ?? 0)) / 86_400_000).toFixed(1);
 
     const question = (p.marketQuestion ?? '').slice(0, 40);
-    const slug     = (p as any).marketSlug ?? p.marketId;
-    const link     = `<a href="https://polymarket.com/event/${slug}">${question}</a>`;
+    const ms   = (p as any).marketSlug;
+    const es   = (p as any).eventSlug;
+    const url  = ms && es ? `https://polymarket.com/event/${es}/${ms}`
+               : ms       ? `https://polymarket.com/event/${ms}`
+               : null;
+    const link = url ? `<a href="${url}">${question}</a>` : `<b>${question}</b>`;
 
     return [
       `<b>${i + 1}. [${mode}]</b> ${link}`,

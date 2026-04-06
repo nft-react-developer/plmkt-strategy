@@ -58,6 +58,9 @@ interface RewardsConfig {
 interface RewardsMarket {
   condition_id:         string;
   question:             string;
+  market_slug?:         string;
+  event_slug?:          string;
+  slug?:                string;
   rewards_max_spread:   number;
   rewards_min_size:     number;
   spread:               number;
@@ -284,7 +287,7 @@ export const rewardsExecutorStrategy: Strategy = {
 
       await positionQueries.addReward(pos.id, score.rewardUsdc, score.qmin, score.inRange);
       totalRewardUsdc += score.rewardUsdc;
-      
+
       const wallIcon = bookAnalysis.wallProtects ? 'W' : ' ';
       const icon     = score.inRange ? 'OK' : 'OUT';
       console.log(
@@ -516,7 +519,7 @@ export const rewardsExecutorStrategy: Strategy = {
 
         const positionId = await positionQueries.open({
           paperTrading: p.paperTrading, marketId: market.condition_id,
-          marketQuestion: market.question, tokenIdYes: tokenYes.token_id,
+          marketQuestion: market.question, marketSlug: market.market_slug ?? market.slug ?? undefined, eventSlug: market.event_slug ?? undefined, tokenIdYes: tokenYes.token_id,
           tokenIdNo: tokenNo?.token_id, rewardId: String(config.id),
           dailyRewardUsdc: ratePerDay, maxSpreadCents, minSizeShares,
           rewardEndDate: new Date(config.end_date), scalingFactorC: 3.0,
@@ -679,6 +682,18 @@ function buildCloseSignal(
   };
 }
 
+/**
+ * Construye la URL correcta de Polymarket para un mercado.
+ * Usa event_slug + market_slug cuando estan disponibles (mas preciso).
+ * Formato: polymarket.com/event/{event_slug}/{market_slug}
+ * O:       polymarket.com/event/{market_slug}  (mercados sin evento padre)
+ */
+function buildMarketUrl(marketSlug?: string, eventSlug?: string): string | null {
+  if (!marketSlug) return null;
+  if (eventSlug) return `https://polymarket.com/event/${eventSlug}/${marketSlug}`;
+  return `https://polymarket.com/event/${marketSlug}`;
+}
+
 async function fetchBook(clobBase: string, tokenId: string): Promise<ClobBook | null> {
   try {
     const res = await fetch(`${clobBase}/book?token_id=${tokenId}`, { signal: AbortSignal.timeout(5_000) });
@@ -688,8 +703,10 @@ async function fetchBook(clobBase: string, tokenId: string): Promise<ClobBook | 
 }
 
 async function fetchCurrentRewardRate(clobBase: string, conditionId: string): Promise<number | null> {
+  // El CLOB rewards API no filtra por condition_id — hay que buscar en la lista completa
+  // Traemos todos los mercados con rewards y buscamos el que coincide
   try {
-    const res  = await fetch(`${clobBase}/rewards/markets/multi?q=${conditionId}&page_size=5`, { signal: AbortSignal.timeout(5_000) });
+    const res  = await fetch(`${clobBase}/rewards/markets/multi?page_size=500`, { signal: AbortSignal.timeout(8_000) });
     if (!res.ok) return null;
     const data = await res.json() as RewardsMarketsResponse;
     const mkt  = (data.data ?? []).find(m => m.condition_id === conditionId);
