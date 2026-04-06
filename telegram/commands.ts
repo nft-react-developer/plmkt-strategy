@@ -41,7 +41,7 @@ export function startCommandListener(): void {
     const text = msg.text ?? '';
     if (!text.startsWith('/')) return;
 
-    const command = text.split(' ')[0].toLowerCase().replace('@' + (_commandBot as any).options?.username ?? '', '');
+    const command = text.split(' ')[0].toLowerCase().replace('@' + (((_commandBot as any).options?.username) ?? ''), '');
 
     logger.info(`[commands] Comando recibido: ${command}`);
 
