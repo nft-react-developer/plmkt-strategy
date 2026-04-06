@@ -41,10 +41,7 @@ export function startCommandListener(): void {
     const text = msg.text ?? '';
     if (!text.startsWith('/')) return;
 
-    const command = text.split(' ')[0].toLowerCase().replace(
-      '@' + ((_commandBot as any).options?.username ?? ''),
-      '',
-    );
+    const command = text.split(' ')[0].toLowerCase().replace('@' + ((_commandBot as any).options?.username ?? ''), '');
 
     logger.info(`[commands] Comando recibido: ${command}`);
 
@@ -85,14 +82,14 @@ async function handleCurrentRewards(chatId: string): Promise<void> {
   const db = await getDb();
 
   // Posiciones abiertas paper
-  const paperPositions = await db!
+  const paperPositions = await db
     .select()
     .from(positions)
     .where(and(eq(positions.status, 'open'), eq(positions.paperTrading, true)))
     .orderBy(desc(positions.rewardsEarnedUsdc));
 
   // Posiciones abiertas real
-  const realPositions = await db!
+  const realPositions = await db
     .select()
     .from(positions)
     .where(and(eq(positions.status, 'open'), eq(positions.paperTrading, false)))
@@ -121,7 +118,8 @@ async function handleCurrentRewards(chatId: string): Promise<void> {
       const question   = (p.marketQuestion ?? p.marketId).slice(0, 38);
       const bar        = buildBar(inRangePct);
 
-      const link = `<a href="https://polymarket.com/event/${p.marketId}">${question}</a>`;
+      const slug = (p as any).marketSlug ?? p.marketId;
+      const link = `<a href="https://polymarket.com/event/${slug}">${question}</a>`;
 
       return [
         `  <b>${i + 1}. ${link}</b>`,
@@ -178,7 +176,8 @@ async function handlePositions(chatId: string): Promise<void> {
     const daysOpen   = ((Date.now() - (p.openedAt?.getTime() ?? 0)) / 86_400_000).toFixed(1);
 
     const question = (p.marketQuestion ?? '').slice(0, 40);
-    const link     = `<a href="https://polymarket.com/event/${p.marketId}">${question}</a>`;
+    const slug     = (p as any).marketSlug ?? p.marketId;
+    const link     = `<a href="https://polymarket.com/event/${slug}">${question}</a>`;
 
     return [
       `<b>${i + 1}. [${mode}]</b> ${link}`,

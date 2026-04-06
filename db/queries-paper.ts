@@ -18,6 +18,7 @@ export const positionQueries = {
     paperTrading:        boolean;
     marketId:            string;
     marketQuestion?:     string;
+    marketSlug?:         string;
     tokenIdYes:          string;
     tokenIdNo?:          string;
     rewardId:            string;
@@ -40,6 +41,7 @@ export const positionQueries = {
       paperTrading:       data.paperTrading,
       marketId:           data.marketId,
       marketQuestion:     data.marketQuestion,
+      marketSlug:         data.marketSlug,
       tokenIdYes:         data.tokenIdYes,
       tokenIdNo:          data.tokenIdNo,
       rewardId:           data.rewardId,
@@ -136,7 +138,7 @@ export const positionQueries = {
 
   async getRecent(paperTrading: boolean, limit = 20) {
     const db = await getDb();
-    return db
+    return db!
       .select()
       .from(positions)
       .where(eq(positions.paperTrading, paperTrading))
@@ -179,7 +181,7 @@ export const orderQueries = {
 
   async getForPosition(positionId: number) {
     const db = await getDb();
-    return db
+    return db!
       .select()
       .from(orders)
       .where(eq(orders.positionId, positionId))
@@ -229,7 +231,7 @@ export const accrualQueries = {
   /** Últimas N muestras de una posición — para debugging */
   async getRecent(positionId: number, limit = 60) {
     const db = await getDb();
-    return db
+    return db!
       .select()
       .from(rewardAccruals)
       .where(eq(rewardAccruals.positionId, positionId))
@@ -309,7 +311,7 @@ export const dailyPnlQueries = {
     const where = paperTrading !== undefined
       ? and(eq(dailyPnl.paperTrading, paperTrading), gte(dailyPnl.date, since))
       : gte(dailyPnl.date, since);
-    return db
+    return db!
       .select()
       .from(dailyPnl)
       .where(where)

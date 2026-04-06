@@ -22,7 +22,7 @@ export async function getDb() {
   });
 
   _db = drizzle(_pool, { schema, mode: 'default' });
-  return _db;
+  return _db!;
 }
 
 export async function closeDb() {

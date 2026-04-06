@@ -163,47 +163,49 @@ export const orderBookAlerts = mysqlTable('order_book_alerts', {
   idxDetected: index('idx_oba_detected').on(t.detectedAt),
 }));
 
+
 export const positions = mysqlTable('positions', {
   id:                  bigint('id', { mode: 'number' }).primaryKey().autoincrement(),
-
+ 
   paperTrading:        boolean('paper_trading').notNull().default(true),
-
+ 
   marketId:            varchar('market_id',      { length: 128 }).notNull(),
   marketQuestion:      varchar('market_question', { length: 512 }),
+  marketSlug:          varchar('market_slug',     { length: 256 }),
   tokenIdYes:          varchar('token_id_yes',    { length: 128 }).notNull(),
   tokenIdNo:           varchar('token_id_no',     { length: 128 }),
-
+ 
   rewardId:            varchar('reward_id',       { length: 128 }).notNull(),
   dailyRewardUsdc:     decimal('daily_reward_usdc',  { precision: 12, scale: 4 }).notNull(),
   maxSpreadCents:      decimal('max_spread_cents',    { precision: 6,  scale: 2 }).notNull(),
   minSizeShares:       decimal('min_size_shares',     { precision: 14, scale: 6 }).notNull().default('0'),
   rewardEndDate:       timestamp('reward_end_date').notNull(),
   scalingFactorC:      decimal('scaling_factor_c',   { precision: 6,  scale: 2 }).notNull().default('3.0'),
-
+ 
   sizeUsdc:            decimal('size_usdc',         { precision: 12, scale: 2 }).notNull(),
   sizePerSideUsdc:     decimal('size_per_side_usdc', { precision: 12, scale: 2 }).notNull(),
-
+ 
   entryMidprice:       decimal('entry_midprice',    { precision: 10, scale: 6 }).notNull(),
   entryBid:            decimal('entry_bid',          { precision: 10, scale: 6 }),
   entryAsk:            decimal('entry_ask',          { precision: 10, scale: 6 }),
   entrySpreadCents:    decimal('entry_spread_cents', { precision: 8,  scale: 4 }),
-
+ 
   dualSideRequired:    boolean('dual_side_required').notNull().default(false),
   totalLiquidityUsdc:  decimal('total_liquidity_usdc', { precision: 18, scale: 2 }),
-
+ 
   status:              mysqlEnum('status', ['open', 'closed']).notNull().default('open'),
   closeReason:         mysqlEnum('close_reason', [
     'reward_ended', 'score_too_low', 'price_moved', 'expired', 'manual',
   ]),
-
+ 
   rewardsEarnedUsdc:   decimal('rewards_earned_usdc', { precision: 12, scale: 4 }).notNull().default('0'),
   feesPaidUsdc:        decimal('fees_paid_usdc',       { precision: 12, scale: 4 }).notNull().default('0'),
   pnlUsdc:             decimal('pnl_usdc',             { precision: 12, scale: 4 }),
-
+ 
   totalQmin:           decimal('total_qmin',       { precision: 18, scale: 6 }).notNull().default('0'),
   samplesInRange:      int('samples_in_range').notNull().default(0),
   samplesTotal:        int('samples_total').notNull().default(0),
-
+ 
   openedAt:            timestamp('opened_at').defaultNow(),
   lastCheckedAt:       timestamp('last_checked_at'),
   closedAt:            timestamp('closed_at'),
@@ -213,27 +215,27 @@ export const positions = mysqlTable('positions', {
   idxPaper:  index('idx_pos_paper').on(t.paperTrading),
   idxOpened: index('idx_pos_opened').on(t.openedAt),
 }));
-
+ 
 export const orders = mysqlTable('orders', {
   id:                   bigint('id', { mode: 'number' }).primaryKey().autoincrement(),
   positionId:           bigint('position_id', { mode: 'number' }).notNull(),
-
+ 
   paperTrading:         boolean('paper_trading').notNull().default(true),
-
+ 
   tokenId:              varchar('token_id', { length: 128 }).notNull(),
   side:                 mysqlEnum('side', ['buy', 'sell']).notNull(),
-
+ 
   price:                decimal('price',       { precision: 10, scale: 6 }).notNull(),
   sizeUsdc:             decimal('size_usdc',   { precision: 12, scale: 2 }).notNull(),
   sizeShares:           decimal('size_shares', { precision: 14, scale: 6 }).notNull(),
   spreadFromMidCents:   decimal('spread_from_mid_cents', { precision: 8, scale: 4 }),
-
+ 
   status:               mysqlEnum('status', ['simulated', 'open', 'filled', 'cancelled']).notNull().default('simulated'),
-
+ 
   filledPrice:          decimal('filled_price',  { precision: 10, scale: 6 }),
   filledAt:             timestamp('filled_at'),
   feePaidUsdc:          decimal('fee_paid_usdc', { precision: 10, scale: 4 }),
-
+ 
   clobOrderId:          varchar('clob_order_id', { length: 128 }),
   placedAt:             timestamp('placed_at').defaultNow(),
 }, t => ({
@@ -241,54 +243,54 @@ export const orders = mysqlTable('orders', {
   idxToken:    index('idx_ord_token').on(t.tokenId),
   idxPaper:    index('idx_ord_paper').on(t.paperTrading),
 }));
-
+ 
 export const rewardAccruals = mysqlTable('reward_accruals', {
   id:              bigint('id', { mode: 'number' }).primaryKey().autoincrement(),
   positionId:      bigint('position_id', { mode: 'number' }).notNull(),
-
+ 
   paperTrading:    boolean('paper_trading').notNull().default(true),
-
+ 
   sampledAt:       timestamp('sampled_at').defaultNow(),
-
+ 
   midprice:        decimal('midprice',     { precision: 10, scale: 6 }).notNull(),
   bestBid:         decimal('best_bid',     { precision: 10, scale: 6 }),
   bestAsk:         decimal('best_ask',     { precision: 10, scale: 6 }),
   spreadCents:     decimal('spread_cents', { precision: 8,  scale: 4 }),
-
+ 
   midExtreme:      boolean('mid_extreme').notNull().default(false),
-
+ 
   scoreQne:        decimal('score_qne',  { precision: 18, scale: 6 }).notNull().default('0'),
   scoreQno:        decimal('score_qno',  { precision: 18, scale: 6 }).notNull().default('0'),
   scoreQmin:       decimal('score_qmin', { precision: 18, scale: 6 }).notNull().default('0'),
-
+ 
   normalizedProxy: decimal('normalized_proxy', { precision: 18, scale: 8 }).notNull().default('0'),
   rewardUsdc:      decimal('reward_usdc',      { precision: 12, scale: 6 }).notNull().default('0'),
-
+ 
   inRange:         boolean('in_range').notNull().default(false),
 }, t => ({
   idxPosition: index('idx_acc_position').on(t.positionId),
   idxSampled:  index('idx_acc_sampled').on(t.sampledAt),
   idxPaper:    index('idx_acc_paper').on(t.paperTrading),
 }));
-
+ 
 export const dailyPnl = mysqlTable('daily_pnl', {
   id:                   int('id').primaryKey().autoincrement(),
-
+ 
   paperTrading:         boolean('paper_trading').notNull().default(true),
   date:                 varchar('date', { length: 10 }).notNull(),
-
+ 
   positionsOpened:      int('positions_opened').notNull().default(0),
   positionsClosed:      int('positions_closed').notNull().default(0),
   positionsOpenEod:     int('positions_open_eod').notNull().default(0),
-
+ 
   rewardsEarnedUsdc:    decimal('rewards_earned_usdc', { precision: 12, scale: 4 }).notNull().default('0'),
   feesPaidUsdc:         decimal('fees_paid_usdc',      { precision: 12, scale: 4 }).notNull().default('0'),
   netPnlUsdc:           decimal('net_pnl_usdc',        { precision: 12, scale: 4 }).notNull().default('0'),
-
+ 
   avgCapitalDeployed:   decimal('avg_capital_deployed',  { precision: 12, scale: 2 }),
   avgTimeInRangePct:    decimal('avg_time_in_range_pct', { precision: 6,  scale: 2 }),
   avgQmin:              decimal('avg_qmin',              { precision: 18, scale: 6 }),
-
+ 
   closedRewardEnded:    int('closed_reward_ended').notNull().default(0),
   closedScoreTooLow:    int('closed_score_too_low').notNull().default(0),
   closedPriceMoved:     int('closed_price_moved').notNull().default(0),
