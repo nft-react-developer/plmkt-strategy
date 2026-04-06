@@ -41,7 +41,10 @@ export function startCommandListener(): void {
     const text = msg.text ?? '';
     if (!text.startsWith('/')) return;
 
-    const command = text.split(' ')[0].toLowerCase().replace('@' + (((_commandBot as any).options?.username) ?? ''), '');
+    const command = text.split(' ')[0].toLowerCase().replace(
+      '@' + ((_commandBot as any).options?.username ?? ''),
+      '',
+    );
 
     logger.info(`[commands] Comando recibido: ${command}`);
 
@@ -118,8 +121,10 @@ async function handleCurrentRewards(chatId: string): Promise<void> {
       const question   = (p.marketQuestion ?? p.marketId).slice(0, 38);
       const bar        = buildBar(inRangePct);
 
+      const link = `<a href="https://polymarket.com/event/${p.marketId}">${question}</a>`;
+
       return [
-        `  <b>${i + 1}. ${question}</b>`,
+        `  <b>${i + 1}. ${link}</b>`,
         `  ${bar} ${inRangePct}% | net: <b>${netS}$${net.toFixed(4)}</b> | pool: $${Number(p.dailyRewardUsdc).toFixed(0)}/d | ${daysOpen}d`,
       ].join('\n');
     }).join('\n\n');
@@ -172,8 +177,11 @@ async function handlePositions(chatId: string): Promise<void> {
       ? Math.round((p.samplesInRange / p.samplesTotal) * 100) : 0;
     const daysOpen   = ((Date.now() - (p.openedAt?.getTime() ?? 0)) / 86_400_000).toFixed(1);
 
+    const question = (p.marketQuestion ?? '').slice(0, 40);
+    const link     = `<a href="https://polymarket.com/event/${p.marketId}">${question}</a>`;
+
     return [
-      `<b>${i + 1}. [${mode}]</b> ${(p.marketQuestion ?? '').slice(0, 40)}`,
+      `<b>${i + 1}. [${mode}]</b> ${link}`,
       `   net: ${net >= 0 ? '+' : ''}$${net.toFixed(4)} | rango: ${inRangePct}% | ${daysOpen}d | pool: $${Number(p.dailyRewardUsdc).toFixed(0)}/d`,
     ].join('\n');
   });
