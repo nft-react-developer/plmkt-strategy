@@ -20,6 +20,10 @@ import { eq, and, desc, sql } from 'drizzle-orm';
 import { strategyQueries } from '../db/queries';
 import { logger } from '../utils/logger';
 
+const CLOB_BASE = process.env.CLOB_API_BASE ?? 'https://clob.polymarket.com';
+const FUNDER    = process.env.POLY_FUNDER    ?? '0x0af2De35b88FEA7e8cb63af04407EE9C57d8bb3C';
+
+
 // ─── Bot con polling para recibir comandos ────────────────────────────────────
 
 let _commandBot: TelegramBot | null = null;
@@ -76,25 +80,49 @@ export function startCommandListener(): void {
   logger.info('[commands] Listener de comandos Telegram activo');
 }
 
+// ─── Tipos de las APIs de validación ──────────────────────────────────────────
+
+interface PolyEarning {
+  asset_address: string;   // condition_id del mercado
+  amount: string;          // USDC ganado ese día
+}
+
+interface PolyPctEntry {
+  condition_id: string;
+  percentage:   number;    // tu % real del pool ahora mismo (0-1)
+  rate_per_day: number;    // rate del mercado en este momento
+}
+
 // ─── Handlers ─────────────────────────────────────────────────────────────────
 
 async function handleCurrentRewards(chatId: string): Promise<void> {
   const db = await getDb();
 
-  // Posiciones abiertas paper
+  // ── 1. Datos de DB (igual que antes) ───────────────────────────────────────
   const paperPositions = await db
     .select()
     .from(positions)
     .where(and(eq(positions.status, 'open'), eq(positions.paperTrading, true)))
     .orderBy(desc(positions.rewardsEarnedUsdc));
 
-  // Posiciones abiertas real
   const realPositions = await db
     .select()
     .from(positions)
     .where(and(eq(positions.status, 'open'), eq(positions.paperTrading, false)))
     .orderBy(desc(positions.rewardsEarnedUsdc));
 
+  // ── 2. APIs de Polymarket en paralelo (solo si hay posiciones reales) ───────
+  const yesterday = new Date(Date.now() - 86_400_000)
+    .toISOString().slice(0, 10);  // YYYY-MM-DD
+
+  const [realEarnings, realPercentages] = realPositions.length > 0
+    ? await Promise.all([
+        fetchRealEarnings(yesterday),
+        fetchRealPercentages(),
+      ])
+    : [new Map<string, number>(), new Map<string, PolyPctEntry>()];
+
+  // ── 3. Sección de posiciones (igual que antes, sin cambios) ─────────────────
   const buildSection = (
     rows: typeof paperPositions,
     label: string,
@@ -118,11 +146,11 @@ async function handleCurrentRewards(chatId: string): Promise<void> {
       const question   = (p.marketQuestion ?? p.marketId).slice(0, 38);
       const bar        = buildBar(inRangePct);
 
-      const ms   = (p as any).marketSlug;
-      const es   = (p as any).eventSlug;
-      const url  = ms && es ? `https://polymarket.com/event/${es}/${ms}`
-                 : ms       ? `https://polymarket.com/event/${ms}`
-                 : null;
+      const ms  = (p as any).marketSlug;
+      const es  = (p as any).eventSlug;
+      const url = ms && es ? `https://polymarket.com/event/${es}/${ms}`
+                : ms       ? `https://polymarket.com/event/${ms}`
+                : null;
       const link = url ? `<a href="${url}">${question}</a>` : `<b>${question}</b>`;
 
       return [
@@ -141,16 +169,87 @@ async function handleCurrentRewards(chatId: string): Promise<void> {
     ].join('\n');
   };
 
-  const ts        = new Date().toISOString().slice(0, 16).replace('T', ' ') + ' UTC';
-  const paperSec  = buildSection(paperPositions, 'Paper Trading', '📋');
-  const realSec   = buildSection(realPositions,  'Real Trading',  '💵');
-  const noData    = !paperPositions.length && !realPositions.length;
+  // ── 4. Sección de validación contra Polymarket real ─────────────────────────
+  const buildValidationSection = (): string => {
+    if (!realPositions.length) return '';
+
+    const lines: string[] = [
+      '',
+      '🔍 <b>Validación vs Polymarket real</b>',
+    ];
+
+    // 4a. Earnings reales de ayer vs estimado de DB del mismo período
+    const totalRealEarned = [...realEarnings.values()].reduce((s, v) => s + v, 0);
+
+    if (totalRealEarned > 0) {
+      // Estimado de DB para ayer: tomamos rewards_earned_usdc / daysOpen como proxy diario
+      const estimatedYesterday = realPositions.reduce((s, p) => {
+        const daysOpen = Math.max(1, (Date.now() - (p.openedAt?.getTime() ?? 0)) / 86_400_000);
+        return s + Number(p.rewardsEarnedUsdc ?? 0) / daysOpen;
+      }, 0);
+
+      const ratio       = estimatedYesterday > 0 ? totalRealEarned / estimatedYesterday : null;
+      const ratioLabel  = ratio !== null
+        ? (ratio >= 0.8 && ratio <= 1.2
+            ? `✅ ${ratio.toFixed(2)}x`
+            : `⚠️ ${ratio.toFixed(2)}x`)
+        : 'N/A';
+
+      lines.push(
+        `  Pagado ayer por Poly: <b>$${totalRealEarned.toFixed(4)}</b>`,
+        `  Estimado DB (≈diario): $${estimatedYesterday.toFixed(4)}`,
+        `  Factor calibración: <b>${ratioLabel}</b>`,
+      );
+    } else {
+      lines.push(`  Earnings ayer: <i>sin datos (primer día o API no responde)</i>`);
+    }
+
+    // 4b. % real actual del pool por posición abierta
+    if (realPercentages.size > 0) {
+      lines.push('', '  <b>Share real del pool ahora:</b>');
+
+      for (const pos of realPositions) {
+        const pct = realPercentages.get(pos.marketId);
+        if (!pct) continue;
+
+        const realPctLabel  = (pct.percentage * 100).toFixed(2);
+        const realRateDay   = (pct.percentage * pct.rate_per_day).toFixed(4);
+
+        // Estimación interna: rewards_earned_usdc / samples_total * 1440
+        const estimatedPerMin = pos.samplesTotal > 0
+          ? Number(pos.rewardsEarnedUsdc) / pos.samplesTotal
+          : 0;
+        const estimatedPerDay  = (estimatedPerMin * 1440).toFixed(4);
+
+        const question = (pos.marketQuestion ?? pos.marketId).slice(0, 30);
+
+        lines.push(
+          `  • <i>${question}</i>`,
+          `    Share: <b>${realPctLabel}%</b> → $${realRateDay}/d real vs $${estimatedPerDay}/d est.`,
+        );
+      }
+    } else {
+      lines.push(`  <i>Share del pool: sin datos (API rewards/percentages)</i>`);
+    }
+
+    return lines.join('\n');
+  };
+
+  // ── 5. Ensamblar mensaje ────────────────────────────────────────────────────
+  const ts       = new Date().toISOString().slice(0, 16).replace('T', ' ') + ' UTC';
+  const paperSec = buildSection(paperPositions, 'Paper Trading', '📋');
+  const realSec  = buildSection(realPositions,  'Real Trading',  '💵');
+  const valSec   = buildValidationSection();
+  const noData   = !paperPositions.length && !realPositions.length;
 
   const msg = [
     `💰 <b>Rewards — Estado actual</b>`,
     `<i>${ts}</i>`,
     '',
-    noData ? '<i>Sin posiciones abiertas</i>' : [paperSec, realSec].filter(Boolean).join('\n\n'),
+    noData
+      ? '<i>Sin posiciones abiertas</i>'
+      : [paperSec, realSec].filter(Boolean).join('\n\n'),
+    valSec,
   ].join('\n');
 
   await sendCommand(chatId, msg);
@@ -248,4 +347,34 @@ async function sendCommand(chatId: string, text: string): Promise<void> {
 function buildBar(pct: number, width = 6): string {
   const filled = Math.round((pct / 100) * width);
   return '█'.repeat(Math.max(0, filled)) + '░'.repeat(Math.max(0, width - filled));
+}
+
+async function fetchRealEarnings(dateStr: string): Promise<Map<string, number>> {
+  // Lo que Polymarket realmente pagó ayer por mercado
+  try {
+    const res = await fetch(
+      `${CLOB_BASE}/rewards/earnings/markets?user=${FUNDER}&date=${dateStr}`,
+      { signal: AbortSignal.timeout(8_000) },
+    );
+    if (!res.ok) return new Map();
+    const data = await res.json() as PolyEarning[];
+    return new Map(data.map(e => [e.asset_address, Number(e.amount)]));
+  } catch {
+    return new Map();
+  }
+}
+
+async function fetchRealPercentages(): Promise<Map<string, PolyPctEntry>> {
+  // Tu % actual del pool por mercado en tiempo real
+  try {
+    const res = await fetch(
+      `${CLOB_BASE}/rewards/percentages?user=${FUNDER}`,
+      { signal: AbortSignal.timeout(8_000) },
+    );
+    if (!res.ok) return new Map();
+    const data = await res.json() as PolyPctEntry[];
+    return new Map(data.map(e => [e.condition_id, e]));
+  } catch {
+    return new Map();
+  }
 }
