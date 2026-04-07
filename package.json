@@ -7,7 +7,9 @@
     "sync-wallets": "tsx scripts/sync-wallets.ts",
     "update-markets": "tsx scripts/update-markets.ts",
     "cli": "tsx scripts/cli.ts",
-    "generate-api-key": "tsx scripts/generate-api-keys.ts"
+    "generate-api-key": "tsx scripts/generate-api-keys.ts",
+    "verify-auth": "tsx scripts/verify-auth.ts",
+    "verify-auth2": "tsx scripts/verify-auth2.ts"
   },
   "dependencies": {
     "@ethersproject/wallet": "5.8.0",

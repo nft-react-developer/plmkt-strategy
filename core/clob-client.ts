@@ -11,9 +11,10 @@
 //   POLY_API_PASSPHRASE  — generada con scripts/generate-api-keys.ts
 //   POLY_FUNDER          — 0x0af2De35b88FEA7e8cb63af04407EE9C57d8bb3C
 //   POLY_SIGNATURE_TYPE  — 2 (GNOSIS_SAFE)
-
+import * as dotenv from 'dotenv';
+dotenv.config();
 import { ClobClient, Side } from '@polymarket/clob-client';
-import { Wallet }            from 'ethers';
+import { Wallet } from '@ethersproject/wallet';
 import { logger }            from '../utils/logger';
 
 const CLOB_BASE        = process.env.CLOB_API_BASE ?? 'https://clob.polymarket.com';
@@ -32,6 +33,11 @@ export function getClobClient(): ClobClient {
   const passphrase    = process.env.POLY_API_PASSPHRASE;
   const funder        = process.env.POLY_FUNDER;
   const sigType       = Number(process.env.POLY_SIGNATURE_TYPE ?? 2);
+
+const w = new Wallet(process.env.PRIVATE_KEY!);
+console.log('wallet.address:', w.address);
+console.log('POLY_FUNDER:', process.env.POLY_FUNDER);
+console.log('POLY_SIGNATURE_TYPE:', process.env.POLY_SIGNATURE_TYPE);
 
   if (!privateKey) throw new Error('PRIVATE_KEY no configurada en .env');
   if (!apiKey || !secret || !passphrase) {
@@ -79,8 +85,7 @@ export interface PostedOrder {
  */
 export async function postOrder(params: OrderParams): Promise<PostedOrder> {
   const client = getClobClient();
-
-  const tickSize = params.tickSize ?? '0.01' as const;
+  const tickSize = params.tickSize ?? '0.01';
   const negRisk  = params.negRisk  ?? false;
 
   logger.info(
@@ -88,22 +93,24 @@ export async function postOrder(params: OrderParams): Promise<PostedOrder> {
     ` | token: ${params.tokenId.slice(0, 10)}...`,
   );
 
-  const result = await client.createAndPostOrder(
-    {
-      tokenID: params.tokenId,
-      price:   params.price,
-      size:    params.size,
-      side:    params.side,
-    },
+ const result = await client.createAndPostOrder(
+    { tokenID: params.tokenId, price: params.price, size: params.size, side: params.side },
     { tickSize, negRisk },
   );
 
+  // ← AÑADIR ESTO: detectar error 400 explícitamente
+  const status = (result as any).status;
+  if (status === 400 || (result as any).error) {
+    const errorMsg = (result as any).error ?? (result as any).message ?? JSON.stringify(result);
+    throw new Error(`CLOB rejected order (${status}): ${errorMsg}`);
+  }
+
   const orderId = (result as any).orderID ?? (result as any).id ?? 'unknown';
-  const status  = (result as any).status ?? 'posted';
+  const statusLabel = (result as any).status ?? 'posted';
 
-  logger.info(`[clob-client] Orden colocada — id: ${orderId} | status: ${status}`);
+  logger.info(`[clob-client] Orden colocada — id: ${orderId} | status: ${statusLabel}`);
 
-  return { orderId, status, tokenId: params.tokenId, price: params.price, size: params.size, side: params.side };
+  return { orderId, status: statusLabel, tokenId: params.tokenId, price: params.price, size: params.size, side: params.side };
 }
 
 /**

@@ -14,14 +14,15 @@
 //
 // NUNCA compartas ni commitees tu private key.
 
-import 'dotenv/config';
+import * as dotenv from 'dotenv';
+dotenv.config();
 import { ApiKeyCreds, ClobClient } from '@polymarket/clob-client';
 import { Wallet }    from '@ethersproject/wallet';
 
 const CLOB_BASE        = 'https://clob.polymarket.com';
 const POLYGON_CHAIN_ID = 137;
-const FUNDER       = process.env.WALLET_ADDRESS!; // Opcional: dirección de tu wallet (puede derivarse de la private key, pero la ponemos explícita para evitar confusiones)
-const SIGNATURE_TYPE   = 1; // 1 = Magic/Email Login o server-side private key signing
+const FUNDER       = process.env.POLY_FUNDER!; // Opcional: dirección de tu wallet (puede derivarse de la private key, pero la ponemos explícita para evitar confusiones)
+const SIGNATURE_TYPE       = Number(process.env.POLY_SIGNATURE_TYPE ?? 1);
 
 async function main() {
   const privateKey = process.env.PRIVATE_KEY;

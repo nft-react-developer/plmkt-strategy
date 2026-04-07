@@ -68,6 +68,8 @@ interface RewardsMarket {
   tokens:               RewardToken[];
   volume_24hr:          number;
   rewards_config:       RewardsConfig[];
+  neg_risk?:            boolean;
+  minimum_tick_size?:   number;
 }
 interface RewardsMarketsResponse { limit: number; count: number; next_cursor: string; data: RewardsMarket[]; }
 interface BookLevel { price: string; size: string; }
@@ -538,15 +540,26 @@ export const rewardsExecutorStrategy: Strategy = {
         );
 
         // Real trading: colocar ordenes en el CLOB
+        // Para órdenes ASK (sell): en lugar de SELL YES (requiere tokens),
+        // colocamos BUY NO al precio complementario (1 - askPrice).
+        // Son económicamente equivalentes (YES + NO = $1) y solo necesitan USDC.
         if (!p.paperTrading) {
+          const tickSizeStr = String(market.minimum_tick_size ?? 0.01) as '0.1' | '0.01' | '0.001' | '0.0001';
           for (const o of plannedOrders) {
+            const isSell = o.side === 'sell';
+            const tokenId = isSell ? tokenNo.token_id  : tokenYes.token_id;
+            const price   = isSell ? Math.round((1 - o.price) * 100) / 100 : o.price;
+            const size    = isSell ? o.sizeUsdc / price : o.sizeShares;
+
             const posted = await postOrder({
-              tokenId: tokenYes.token_id, price: o.price, size: o.sizeShares,
-              side: o.side === 'buy' ? 'BUY' : 'SELL',
+              tokenId, price, size, side: 'BUY',
+              negRisk: market.neg_risk ?? false,
+              tickSize: tickSizeStr,
             }).catch(err => { logger.error('[rewards_executor] postOrder failed', err); return null; });
 
             if (posted) {
-              logger.info(`[rewards_executor] Orden ${o.side} colocada | id: ${posted.orderId} @ ${o.price.toFixed(4)}`);
+              const label = isSell ? `BUY NO @ ${price.toFixed(2)} (≡ SELL YES @ ${o.price.toFixed(2)})` : `BUY YES @ ${price.toFixed(2)}`;
+              logger.info(`[rewards_executor] Orden colocada | id: ${posted.orderId} | ${label}`);
             }
           }
         }
@@ -718,5 +731,24 @@ async function fetchRewardMarkets(clobBase: string): Promise<RewardsMarket[]> {
   const res  = await fetch(`${clobBase}/rewards/markets/multi?order_by=rate_per_day&position=DESC&page_size=100`, { signal: AbortSignal.timeout(10_000) });
   if (!res.ok) throw new Error(`CLOB rewards API ${res.status}`);
   const data = await res.json() as RewardsMarketsResponse;
-  return (data.data ?? []).filter(m => m.rewards_config?.length > 0 && m.tokens?.length >= 2);
+  const markets = (data.data ?? []).filter(m => m.rewards_config?.length > 0 && m.tokens?.length >= 2);
+
+  // Enriquecer con neg_risk y minimum_tick_size desde /markets endpoint
+  const ids = markets.map(m => m.condition_id).join(',');
+  try {
+    const detailRes = await fetch(`${clobBase}/markets?condition_ids=${ids}`, { signal: AbortSignal.timeout(10_000) });
+    if (detailRes.ok) {
+      const detailData = await detailRes.json() as { data: Array<{ condition_id: string; neg_risk: boolean; minimum_tick_size: number }> };
+      const detailMap = new Map((detailData.data ?? []).map(d => [d.condition_id, d]));
+      for (const m of markets) {
+        const d = detailMap.get(m.condition_id);
+        if (d) {
+          m.neg_risk          = d.neg_risk ?? false;
+          m.minimum_tick_size = d.minimum_tick_size ?? 0.01;
+        }
+      }
+    }
+  } catch { /* si falla el enrich, seguimos con defaults */ }
+
+  return markets;
 }

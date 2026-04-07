@@ -146,49 +146,30 @@ export function calcOrderPrices(
   placement:         PlacementStrategy = 'mid',
 ): Array<{ side: 'buy' | 'sell'; price: number; sizeUsdc: number; sizeShares: number; spreadFromMidCents: number }> {
 
-  // Calcular distancia al mid segun estrategia
   let targetSpreadCents: number;
   switch (placement) {
-    case 'tight':
-      // 1c del mid — nunca superar maxSpread - 0.5 para no salirse del rango
-      targetSpreadCents = Math.min(1.0, maxSpreadCents - 0.5);
-      break;
-    case 'mid':
-      // Mitad del maxSpread — estrategia recomendada para evitar fills
-      targetSpreadCents = maxSpreadCents / 2;
-      break;
-    case 'wide':
-      // 80% del maxSpread — maximo alejamiento del mid dentro del rango
-      targetSpreadCents = maxSpreadCents * 0.80;
-      break;
-    default:
-      targetSpreadCents = maxSpreadCents / 2;
+    case 'tight': targetSpreadCents = Math.min(1.0, maxSpreadCents - 0.5); break;
+    case 'mid':   targetSpreadCents = maxSpreadCents / 2; break;
+    case 'wide':  targetSpreadCents = maxSpreadCents * 0.80; break;
+    default:      targetSpreadCents = maxSpreadCents / 2;
   }
 
-  // Asegurar que siempre queda dentro del rango valido
   targetSpreadCents = Math.max(0.5, Math.min(targetSpreadCents, maxSpreadCents - 0.5));
   const targetSpread = targetSpreadCents / 100;
 
-  const bidPrice = Math.max(0.01, midprice - targetSpread);
-  const askPrice = Math.min(0.99, midprice + targetSpread);
+  const rawBid = midprice - targetSpread;
+  const rawAsk = midprice + targetSpread;
+
+  // ← AÑADIR: redondear al tick size (0.01)
+  const tick    = 0.01;
+  const bidPrice = Math.max(0.01, Math.round(rawBid / tick) * tick);
+  const askPrice = Math.min(0.99, Math.round(rawAsk / tick) * tick);
 
   const bidShares = sizePerSideUsdc / bidPrice;
   const askShares = sizePerSideUsdc / askPrice;
 
   return [
-    {
-      side:               'buy' as const,
-      price:              bidPrice,
-      sizeUsdc:           sizePerSideUsdc,
-      sizeShares:         bidShares,
-      spreadFromMidCents: targetSpreadCents,
-    },
-    {
-      side:               'sell' as const,
-      price:              askPrice,
-      sizeUsdc:           sizePerSideUsdc,
-      sizeShares:         askShares,
-      spreadFromMidCents: targetSpreadCents,
-    },
+    { side: 'buy',  price: bidPrice, sizeUsdc: sizePerSideUsdc, sizeShares: bidShares, spreadFromMidCents: targetSpreadCents },
+    { side: 'sell', price: askPrice, sizeUsdc: sizePerSideUsdc, sizeShares: askShares, spreadFromMidCents: targetSpreadCents },
   ];
 }
