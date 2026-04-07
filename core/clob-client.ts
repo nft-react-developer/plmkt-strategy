@@ -9,7 +9,7 @@
 //   POLY_API_KEY         — generada con scripts/generate-api-keys.ts
 //   POLY_API_SECRET      — generada con scripts/generate-api-keys.ts
 //   POLY_API_PASSPHRASE  — generada con scripts/generate-api-keys.ts
-//   POLY_FUNDER          — 0x0af2De35b88FEA7e8cb63af04407EE9C57d8bb3C
+//   POLY_FUNDER          
 //   POLY_SIGNATURE_TYPE  — 2 (GNOSIS_SAFE)
 import * as dotenv from 'dotenv';
 dotenv.config();
