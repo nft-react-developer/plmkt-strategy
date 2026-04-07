@@ -6,7 +6,8 @@
     "migrate": "tsx scripts/migrate.ts",
     "sync-wallets": "tsx scripts/sync-wallets.ts",
     "update-markets": "tsx scripts/update-markets.ts",
-    "cli": "tsx scripts/cli.ts"
+    "cli": "tsx scripts/cli.ts",
+    "generate-api-key": "tsx scripts/generate-api-keys.ts"
   },
   "dependencies": {
     "@ethersproject/wallet": "5.8.0",

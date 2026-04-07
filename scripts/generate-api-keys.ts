@@ -37,8 +37,8 @@ async function main() {
     console.log(`\n[generate-api-keys] Wallet: ${signer.address}`);
     console.log(`[generate-api-keys] Funder: ${FUNDER}`);
     console.log(`[generate-api-keys] SignatureType: ${SIGNATURE_TYPE}\n`);
-  } catch {
-    console.error('ERROR: private key invalida. Debe ser hex (0x...)');
+  } catch (err) {
+    console.log('ERROR: private key invalida. Debe ser hex (0x...)', err);
     process.exit(1);
   }
 

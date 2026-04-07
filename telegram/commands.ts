@@ -21,7 +21,7 @@ import { strategyQueries } from '../db/queries';
 import { logger } from '../utils/logger';
 
 const CLOB_BASE = process.env.CLOB_API_BASE ?? 'https://clob.polymarket.com';
-const FUNDER    = process.env.POLY_FUNDER    ?? '0x0af2De35b88FEA7e8cb63af04407EE9C57d8bb3C';
+const FUNDER    = process.env.POLY_FUNDER;
 
 
 // ─── Bot con polling para recibir comandos ────────────────────────────────────

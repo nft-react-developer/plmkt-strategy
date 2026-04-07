@@ -12,9 +12,9 @@
 //   POLY_FUNDER          — 0x0af2De35b88FEA7e8cb63af04407EE9C57d8bb3C
 //   POLY_SIGNATURE_TYPE  — 2 (GNOSIS_SAFE)
 
-import { ClobClient }  from '@polymarket/clob-client';
-import { Wallet }      from 'ethers';
-import { logger }      from '../utils/logger';
+import { ClobClient, Side } from '@polymarket/clob-client';
+import { Wallet }            from 'ethers';
+import { logger }            from '../utils/logger';
 
 const CLOB_BASE        = process.env.CLOB_API_BASE ?? 'https://clob.polymarket.com';
 const POLYGON_CHAIN_ID = 137;
@@ -30,7 +30,7 @@ export function getClobClient(): ClobClient {
   const apiKey        = process.env.POLY_API_KEY;
   const secret        = process.env.POLY_API_SECRET;
   const passphrase    = process.env.POLY_API_PASSPHRASE;
-  const funder        = process.env.POLY_FUNDER ?? '0x0af2De35b88FEA7e8cb63af04407EE9C57d8bb3C';
+  const funder        = process.env.POLY_FUNDER;
   const sigType       = Number(process.env.POLY_SIGNATURE_TYPE ?? 2);
 
   if (!privateKey) throw new Error('PRIVATE_KEY no configurada en .env');
@@ -44,7 +44,7 @@ export function getClobClient(): ClobClient {
   _client = new ClobClient(
     CLOB_BASE,
     POLYGON_CHAIN_ID,
-    wallet,
+    wallet as any,
     { key: apiKey, secret, passphrase },
     sigType,
     funder,
@@ -59,8 +59,8 @@ export interface OrderParams {
   tokenId:  string;
   price:    number;   // 0.01 – 0.99
   size:     number;   // en shares
-  side:     'BUY' | 'SELL';
-  tickSize?: string;  // default '0.01'
+  side:     Side;
+  tickSize?: '0.1' | '0.01' | '0.001' | '0.0001';  // default '0.01'
   negRisk?:  boolean;
 }
 
@@ -70,7 +70,7 @@ export interface PostedOrder {
   tokenId:   string;
   price:     number;
   size:      number;
-  side:      'BUY' | 'SELL';
+  side:      Side;
 }
 
 /**
@@ -80,7 +80,7 @@ export interface PostedOrder {
 export async function postOrder(params: OrderParams): Promise<PostedOrder> {
   const client = getClobClient();
 
-  const tickSize = params.tickSize ?? '0.01';
+  const tickSize = params.tickSize ?? '0.01' as const;
   const negRisk  = params.negRisk  ?? false;
 
   logger.info(
@@ -133,7 +133,7 @@ export async function cancelAllForMarket(tokenId: string): Promise<void> {
 export async function getOpenOrders(tokenId?: string): Promise<any[]> {
   const client = getClobClient();
   const params = tokenId ? { asset_id: tokenId } : {};
-  const orders = await client.getOrders(params as any);
+  const orders = await client.getOpenOrders(params as any);
   return orders ?? [];
 }
 
@@ -154,7 +154,7 @@ export async function getMyTrades(tokenId?: string): Promise<any[]> {
 export async function verifyAuth(): Promise<boolean> {
   try {
     const client = getClobClient();
-    await client.getOrders();
+    await client.getOpenOrders();
     logger.info('[clob-client] Auth verificada correctamente');
     return true;
   } catch (err) {
