@@ -46,6 +46,7 @@ import { logger }                                                               
 import { syncInventory, rebalanceIfNeeded, closeInventoryPosition, getInventoryState } from '../../core/inventory-manager';
 import { repriceIfNeeded, requeueIfNeeded, clearRepriceTracker, clearRequeueTracker } from '../../core/order-replacer';
 import { postOrder, cancelAllForMarket, verifyAuth }                                 from '../../core/clob-client';
+import { Side } from '@polymarket/clob-client';
 
 // ---- Tipos ------------------------------------------------------------------
 
@@ -552,7 +553,7 @@ export const rewardsExecutorStrategy: Strategy = {
             const size    = isSell ? o.sizeUsdc / price : o.sizeShares;
 
             const posted = await postOrder({
-              tokenId, price, size, side: 'BUY',
+              tokenId, price, size, side: Side.BUY,
               negRisk: market.neg_risk ?? false,
               tickSize: tickSizeStr,
             }).catch(err => { logger.error('[rewards_executor] postOrder failed', err); return null; });
