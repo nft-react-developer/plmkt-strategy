@@ -226,7 +226,7 @@ export const rewardsExecutorStrategy: Strategy = {
         }).catch(() => {});
       }
 
-      const posOrders  = await orderQueries.getForPosition(pos.id);
+      const posOrders  = await orderQueries.getOpenForPosition(pos.id);
       const ordersYes: ScoredOrder[] = posOrders
         .filter(o => o.tokenId === pos.tokenIdYes)
         .map(o => ({ tokenId: o.tokenId, side: o.side, price: Number(o.price), sizeShares: Number(o.sizeShares) }));
