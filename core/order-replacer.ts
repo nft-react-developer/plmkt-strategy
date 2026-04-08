@@ -243,13 +243,14 @@ export async function requeueIfNeeded(
   params: {
     requeueIntervalMinutes: number;
     paperTrading:           boolean;
+    forceIfOutOfRange?:     boolean;  // saltea el rate limit si las órdenes están fuera de rango
   },
 ): Promise<RequeueResult> {
   const intervalMs  = params.requeueIntervalMinutes * 60_000;
   const lastRequeue = requeueTimestamps.get(positionId) ?? 0;
   const now         = Date.now();
 
-  if (now - lastRequeue < intervalMs) {
+  if (now - lastRequeue < intervalMs && !params.forceIfOutOfRange) {
     const nextIn = Math.ceil((lastRequeue + intervalMs - now) / 60_000);
     return { action: 'skipped', reason: `proximo re-queue en ${nextIn}min` };
   }

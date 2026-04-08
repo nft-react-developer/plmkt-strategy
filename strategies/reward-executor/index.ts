@@ -376,7 +376,7 @@ export const rewardsExecutorStrategy: Strategy = {
             pos.id, pos.tokenIdYes,
             Number(pos.maxSpreadCents), Number(pos.sizePerSideUsdc),
             pos.dualSideRequired ?? false, midprice,
-            { requeueIntervalMinutes: p.requeueIntervalMinutes, paperTrading: false },
+            { requeueIntervalMinutes: p.requeueIntervalMinutes, paperTrading: false, forceIfOutOfRange: ordersOutOfRange },
           ).catch(() => null);
           if (requeue?.action === 'requeued') {
             const reason = ordersOutOfRange && bookAnalysis.wallProtects
