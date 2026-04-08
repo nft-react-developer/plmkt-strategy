@@ -40,8 +40,9 @@ export interface InventoryState {
   unrealizedPnl:  number;   // estimado al precio actual
   openBidOrderId: string | null;
   openAskOrderId: string | null;
-  // FIX: indicar si hay órdenes que fueron filladas (para cerrar posición)
   hasFills:       boolean;
+  // Órdenes activas en el CLOB en este momento (fuente de verdad para precios reales)
+  liveOrders:     { id: string; side: string; price: number; size: number }[];
 }
 
 export interface InventoryManagerParams {
@@ -129,6 +130,14 @@ export async function syncInventory(
     openBidOrderId: openBid?.id ?? null,
     openAskOrderId: openAsk?.id ?? null,
     hasFills,
+    liveOrders: openOrders
+      .filter((o: any) => o.status === 'LIVE')
+      .map((o: any) => ({
+        id:    String(o.id),
+        side:  String(o.side),
+        price: Number(o.price),
+        size:  Number(o.size ?? o.original_size ?? 0),
+      })),
   };
 
   inventoryState.set(tokenIdYes, state);

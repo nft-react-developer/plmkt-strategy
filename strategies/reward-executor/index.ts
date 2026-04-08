@@ -32,7 +32,7 @@ import { calcTakerFee, parseCategory }                                          
 import { logger }                                                                    from '../../utils/logger';
 import { syncInventory, closeInventoryPosition, getInventoryState, rebalanceWithBreakEvenHedge, clearBreakEvenHedge } from '../../core/inventory-manager';
 import { repriceIfNeeded, requeueIfNeeded, clearRepriceTracker, clearRequeueTracker } from '../../core/order-replacer';
-import { postOrder, cancelAllForMarket, verifyAuth }                                 from '../../core/clob-client';
+import { postOrder, cancelAllForMarket, verifyAuth, getOpenOrders }                  from '../../core/clob-client';
 import { Side } from '@polymarket/clob-client';
 
 // ---- Tipos ------------------------------------------------------------------
@@ -226,13 +226,46 @@ export const rewardsExecutorStrategy: Strategy = {
         }).catch(() => {});
       }
 
-      const posOrders  = await orderQueries.getOpenForPosition(pos.id);
-      const ordersYes: ScoredOrder[] = posOrders
-        .filter(o => o.tokenId === pos.tokenIdYes)
-        .map(o => ({ tokenId: o.tokenId, side: o.side, price: Number(o.price), sizeShares: Number(o.sizeShares) }));
-      const ordersNo: ScoredOrder[] = posOrders
-        .filter(o => o.tokenId === pos.tokenIdNo)
-        .map(o => ({ tokenId: o.tokenId, side: o.side, price: Number(o.price), sizeShares: Number(o.sizeShares) }));
+      // Sincronizar inventario ANTES del score para tener liveOrders del CLOB real.
+      // Esto evita usar precios de DB que pueden estar desincronizados.
+      const invStateEarly = !p.paperTrading
+        ? await syncInventory(
+            pos.id, pos.tokenIdYes, pos.tokenIdNo, midprice,
+            { maxInventoryValueUsdc: Number(pos.sizeUsdc) * 2 },
+          ).catch(() => null)
+        : null;
+
+      // Usar órdenes vivas del CLOB (real) o DB (paper)
+      let ordersYes: ScoredOrder[];
+      let ordersNo: ScoredOrder[];
+      if (invStateEarly) {
+        ordersYes = invStateEarly.liveOrders.map(o => ({
+          tokenId: pos.tokenIdYes,
+          side: o.side.toLowerCase() as 'buy' | 'sell',
+          price: o.price, sizeShares: o.size,
+        }));
+        if (pos.tokenIdNo) {
+          const liveNo = await getOpenOrders(pos.tokenIdNo);
+          ordersNo = liveNo
+            .filter((o: any) => o.status === 'LIVE')
+            .map((o: any) => ({
+              tokenId: pos.tokenIdNo!,
+              side: String(o.side).toLowerCase() as 'buy' | 'sell',
+              price: Number(o.price),
+              sizeShares: Number(o.size ?? o.original_size ?? 0),
+            }));
+        } else {
+          ordersNo = [];
+        }
+      } else {
+        const posOrders = await orderQueries.getOpenForPosition(pos.id);
+        ordersYes = posOrders
+          .filter(o => o.tokenId === pos.tokenIdYes)
+          .map(o => ({ tokenId: o.tokenId, side: o.side, price: Number(o.price), sizeShares: Number(o.sizeShares) }));
+        ordersNo = posOrders
+          .filter(o => o.tokenId === pos.tokenIdNo)
+          .map(o => ({ tokenId: o.tokenId, side: o.side, price: Number(o.price), sizeShares: Number(o.sizeShares) }));
+      }
 
       const score = calcSampleScore(
         ordersYes, ordersNo, midprice,
@@ -334,10 +367,8 @@ export const rewardsExecutorStrategy: Strategy = {
 
       // ---- Gestion de ordenes (real trading) ---------------------------------
       if (!p.paperTrading) {
-        const invState = await syncInventory(
-          pos.id, pos.tokenIdYes, pos.tokenIdNo, midprice,
-          { maxInventoryValueUsdc: Number(pos.sizeUsdc) * 2 },
-        ).catch(() => null);
+        // invStateEarly ya fue calculado arriba — reutilizarlo
+        const invState = invStateEarly;
 
         // Si hay exposición neta (fills de BUY sin cubrir), colocar LIMIT SELL
         // al break-even en vez de cerrar a mercado → cobrar maker rebate, no pagar taker fee.
@@ -361,12 +392,10 @@ export const rewardsExecutorStrategy: Strategy = {
         ).catch(() => null);
 
         // Detectar si alguna orden activa quedó fuera del rango de rewards.
-        // Si es así, hay que moverla aunque la muralla proteja — una orden fuera
-        // de rango no gana rewards, así que la wall protection no aporta nada.
-        const dbOrders = await orderQueries.getOpenForPosition(pos.id);
+        // Usa liveOrders del CLOB (fuente de verdad) en vez de DB.
         const maxSpreadDecimal = Number(pos.maxSpreadCents) / 100;
-        const ordersOutOfRange = dbOrders.some(o =>
-          Math.abs(Number(o.price) - midprice) > maxSpreadDecimal,
+        const ordersOutOfRange = (invState?.liveOrders ?? []).some(o =>
+          Math.abs(o.price - midprice) > maxSpreadDecimal,
         );
 
         if (reprice?.action === 'repriced') {
