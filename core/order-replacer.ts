@@ -22,6 +22,7 @@ import { calcMidprice, calcOrderPrices }              from './rewards-scoring';
 import { orderQueries, positionQueries }              from '../db/queries-paper';
 import { calcTakerFee, parseCategory }               from '../utils/fees';
 import { logger }                                    from '../utils/logger';
+import { Side } from '@polymarket/clob-client';
 
 // ─── Tipos ───────────────────────────────────────────────────────────────────
 
@@ -144,10 +145,11 @@ export async function repriceIfNeeded(
       // 2. Colocar nuevas órdenes
       for (const o of newOrders) {
         const posted = await postOrder({
-          tokenId: tokenIdYes,
-          price:   o.price,
-          size:    o.sizeShares,
-          side:    o.side === 'buy' ? 'BUY' : 'SELL',
+          tokenId:  tokenIdYes,
+          price:    o.price,
+          size:     o.sizeShares,
+          side:     o.side === 'buy' ? Side.BUY : Side.SELL,
+          postOnly: true,
         });
 
         if (o.side === 'buy')  newBidOrderId = posted.orderId;
@@ -280,10 +282,11 @@ export async function requeueIfNeeded(
     await cancelAllForMarket(tokenIdYes);
     for (const o of newOrders) {
       const posted = await postOrder({
-        tokenId: tokenIdYes,
-        price:   o.price,
-        size:    o.sizeShares,
-        side:    o.side === 'buy' ? 'BUY' : 'SELL',
+        tokenId:  tokenIdYes,
+        price:    o.price,
+        size:     o.sizeShares,
+        side:     o.side === 'buy' ? Side.BUY : Side.SELL,
+        postOnly: true,
       });
       await orderQueries.insertMany([{
         positionId,
@@ -357,10 +360,11 @@ export async function cancelAndRequeueOnWallBreak(
     await cancelAllForMarket(tokenIdYes);
     for (const o of newOrders) {
       const posted = await postOrder({
-        tokenId: tokenIdYes,
-        price:   o.price,
-        size:    o.sizeShares,
-        side:    o.side === 'buy' ? 'BUY' : 'SELL',
+        tokenId:  tokenIdYes,
+        price:    o.price,
+        size:     o.sizeShares,
+        side:     o.side === 'buy' ? Side.BUY : Side.SELL,
+        postOnly: true,
       });
       await orderQueries.insertMany([{
         positionId,

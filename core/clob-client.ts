@@ -62,12 +62,13 @@ console.log('POLY_SIGNATURE_TYPE:', process.env.POLY_SIGNATURE_TYPE);
 // ─── Ordenes ─────────────────────────────────────────────────────────────────
 
 export interface OrderParams {
-  tokenId:  string;
-  price:    number;   // 0.01 – 0.99
-  size:     number;   // en shares
-  side:     Side;
+  tokenId:   string;
+  price:     number;   // 0.01 – 0.99
+  size:      number;   // en shares
+  side:      Side;
   tickSize?: '0.1' | '0.01' | '0.001' | '0.0001';  // default '0.01'
   negRisk?:  boolean;
+  postOnly?: boolean;  // si true: rechaza si ejecutaría inmediatamente (garantiza maker/rebate)
 }
 
 export interface PostedOrder {
@@ -84,18 +85,23 @@ export interface PostedOrder {
  * Firma el payload con la private key y la envía con L2 headers.
  */
 export async function postOrder(params: OrderParams): Promise<PostedOrder> {
-  const client = getClobClient();
+  const client   = getClobClient();
   const tickSize = params.tickSize ?? '0.01';
   const negRisk  = params.negRisk  ?? false;
+  const postOnly = params.postOnly ?? false;
 
   logger.info(
     `[clob-client] POST order — ${params.side} ${params.size} shares @ ${params.price}` +
-    ` | token: ${params.tokenId.slice(0, 10)}...`,
+    ` | token: ${params.tokenId.slice(0, 10)}...` +
+    (postOnly ? ' | postOnly=true' : ''),
   );
 
- const result = await client.createAndPostOrder(
+  const result = await client.createAndPostOrder(
     { tokenID: params.tokenId, price: params.price, size: params.size, side: params.side },
     { tickSize, negRisk },
+    undefined,  // orderType: GTC por defecto
+    false,      // deferExec
+    postOnly,
   );
 
   // ← AÑADIR ESTO: detectar error 400 explícitamente

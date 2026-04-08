@@ -360,9 +360,18 @@ export const rewardsExecutorStrategy: Strategy = {
           { paperTrading: false, repricingThresholdCents: 1.5 },
         ).catch(() => null);
 
+        // Detectar si alguna orden activa quedó fuera del rango de rewards.
+        // Si es así, hay que moverla aunque la muralla proteja — una orden fuera
+        // de rango no gana rewards, así que la wall protection no aporta nada.
+        const dbOrders = await orderQueries.getOpenForPosition(pos.id);
+        const maxSpreadDecimal = Number(pos.maxSpreadCents) / 100;
+        const ordersOutOfRange = dbOrders.some(o =>
+          Math.abs(Number(o.price) - midprice) > maxSpreadDecimal,
+        );
+
         if (reprice?.action === 'repriced') {
           console.log(`[rewards_executor]   REPRICED #${pos.id} ${(reprice.oldMidprice! * 100).toFixed(1)}c -> ${(reprice.newMidprice! * 100).toFixed(1)}c`);
-        } else if (!bookAnalysis.wallProtects) {
+        } else if (!bookAnalysis.wallProtects || ordersOutOfRange) {
           const requeue = await requeueIfNeeded(
             pos.id, pos.tokenIdYes,
             Number(pos.maxSpreadCents), Number(pos.sizePerSideUsdc),
@@ -370,10 +379,13 @@ export const rewardsExecutorStrategy: Strategy = {
             { requeueIntervalMinutes: p.requeueIntervalMinutes, paperTrading: false },
           ).catch(() => null);
           if (requeue?.action === 'requeued') {
-            console.log(`[rewards_executor]   REQUEUE #${pos.id} (sin muralla)`);
+            const reason = ordersOutOfRange && bookAnalysis.wallProtects
+              ? 'ordenes fuera de rango (muralla ignorada)'
+              : 'sin muralla';
+            console.log(`[rewards_executor]   REQUEUE #${pos.id} (${reason})`);
           }
         } else {
-          console.log(`[rewards_executor]   HOLD #${pos.id} — muralla $${bookAnalysis.maxWallUsdc.toFixed(0)} protege, no cancelar`);
+          console.log(`[rewards_executor]   HOLD #${pos.id} — muralla $${bookAnalysis.maxWallUsdc.toFixed(0)} protege, ordenes en rango`);
         }
 
       } else {
@@ -522,15 +534,23 @@ export const rewardsExecutorStrategy: Strategy = {
 
             const posted = await postOrder({
               tokenId, price, size, side: Side.BUY,
-              negRisk: market.neg_risk ?? false,
+              negRisk:  market.neg_risk ?? false,
               tickSize: tickSizeStr,
+              postOnly: true,  // garantiza entrada como maker → cobra rebate, no paga taker fee
             }).catch(err => { logger.error('[rewards_executor] postOrder failed', err); return null; });
 
             if (posted) {
               const label = isSell
                 ? `BUY NO @ ${price.toFixed(2)} (≡ SELL YES @ ${o.price.toFixed(2)})`
                 : `BUY YES @ ${price.toFixed(2)}`;
-              logger.info(`[rewards_executor] Orden colocada | id: ${posted.orderId} | status: ${posted.status} | ${label}`);
+              const marketLink = market.event_slug
+                ? `https://polymarket.com/event/${market.event_slug}`
+                : market.market_slug ? `https://polymarket.com/market/${market.market_slug}` : null;
+              logger.info(
+                `[rewards_executor] Orden colocada | id: ${posted.orderId} | status: ${posted.status} | ${label}` +
+                ` | "${market.question.slice(0, 50)}"` +
+                (marketLink ? ` | ${marketLink}` : ''),
+              );
 
               await orderQueries.insertMany([{
                 positionId,
@@ -546,12 +566,19 @@ export const rewardsExecutorStrategy: Strategy = {
               }]);
 
               if (posted.status === 'matched') {
+                const marketLink = market.event_slug
+                  ? `https://polymarket.com/event/${market.event_slug}`
+                  : market.market_slug ? `https://polymarket.com/market/${market.market_slug}` : null;
                 logger.warn(
                   `[rewards_executor] ⚠️ Orden fillada inmediatamente (status: matched)` +
-                  ` — colocando LIMIT SELL break-even @ ${price.toFixed(4)}`,
+                  ` — colocando LIMIT SELL break-even @ ${price.toFixed(4)}` +
+                  ` | "${market.question.slice(0, 50)}"` +
+                  (marketLink ? ` | ${marketLink}` : ''),
                 );
                 immediatelyFilled = true;
                 filledOrders.push({ tokenId, price, size });
+                // Salir del loop: no tiene sentido postear más LP si ya hubo fill
+                break;
               }
             }
           }
@@ -570,16 +597,29 @@ export const rewardsExecutorStrategy: Strategy = {
 
             // 2. Colocar LIMIT SELL al break-even para cada orden fillada
             for (const filled of filledOrders) {
-              await postOrder({
-                tokenId: filled.tokenId,
-                price:   filled.price,
-                size:    filled.size,
-                side:    Side.SELL,
-              }).catch(err => logger.error('[rewards_executor] Error colocando break-even sell', err));
-              logger.info(
-                `[rewards_executor] Break-even SELL colocado | ` +
-                `SELL ${filled.size.toFixed(2)} @ ${filled.price.toFixed(4)} (maker rebate)`,
-              );
+              const breakEvenResult = await postOrder({
+                tokenId:  filled.tokenId,
+                price:    filled.price,
+                size:     filled.size,
+                side:     Side.SELL,
+                negRisk:  market.neg_risk ?? false,
+                tickSize: tickSizeStr,
+              }).catch(err => {
+                logger.error('[rewards_executor] Error colocando break-even sell', err);
+                return null;
+              });
+
+              if (breakEvenResult) {
+                const marketLink = market.event_slug
+                  ? `https://polymarket.com/event/${market.event_slug}`
+                  : market.market_slug ? `https://polymarket.com/market/${market.market_slug}` : null;
+                logger.info(
+                  `[rewards_executor] Break-even SELL colocado | id: ${breakEvenResult.orderId} | ` +
+                  `SELL ${filled.size.toFixed(2)} @ ${filled.price.toFixed(4)} (maker rebate) | ` +
+                  `"${market.question.slice(0, 50)}"` +
+                  (marketLink ? ` | ${marketLink}` : ''),
+                );
+              }
             }
 
             // 3. La posición SIGUE ABIERTA — el próximo tick recoloca LP y monitorea
