@@ -312,3 +312,74 @@ export async function requeueIfNeeded(
 export function clearRequeueTracker(positionId: number): void {
   requeueTimestamps.delete(positionId);
 }
+
+// ---- Cancel por muro roto ---------------------------------------------------
+
+/**
+ * Cancela y recoloca órdenes inmediatamente cuando el muro protector se rompe.
+ * No respeta el intervalo de re-queue — actúa de emergencia.
+ */
+export async function cancelAndRequeueOnWallBreak(
+  positionId:       number,
+  tokenIdYes:       string,
+  maxSpreadCents:   number,
+  sizePerSideUsdc:  number,
+  dualSideRequired: boolean,
+  currentMidprice:  number,
+  paperTrading:     boolean,
+): Promise<RequeueResult> {
+  logger.info(`[order-replacer] WALL BREAK #${positionId} — cancelando y recolocando inmediatamente`);
+
+  const newOrders = calcOrderPrices(currentMidprice, maxSpreadCents, sizePerSideUsdc, dualSideRequired);
+
+  if (paperTrading) {
+    await orderQueries.insertMany(
+      newOrders.map(o => ({
+        positionId,
+        paperTrading:       true,
+        tokenId:            tokenIdYes,
+        side:               o.side,
+        price:              o.price,
+        sizeUsdc:           o.sizeUsdc,
+        sizeShares:         o.sizeShares,
+        spreadFromMidCents: o.spreadFromMidCents,
+      })),
+    );
+    // Resetear timer para que no re-queue inmediatamente después
+    requeueTimestamps.set(positionId, Date.now());
+    const bid = newOrders.find(o => o.side === 'buy');
+    const ask = newOrders.find(o => o.side === 'sell');
+    console.log(`[order-replacer] WALL BREAK PAPER #${positionId} | bid=${bid ? (bid.price * 100).toFixed(1) : '?'}c ask=${ask ? (ask.price * 100).toFixed(1) : '?'}c`);
+    return { action: 'requeued' };
+  }
+
+  try {
+    await cancelAllForMarket(tokenIdYes);
+    for (const o of newOrders) {
+      const posted = await postOrder({
+        tokenId: tokenIdYes,
+        price:   o.price,
+        size:    o.sizeShares,
+        side:    o.side === 'buy' ? 'BUY' : 'SELL',
+      });
+      await orderQueries.insertMany([{
+        positionId,
+        paperTrading:       false,
+        tokenId:            tokenIdYes,
+        side:               o.side,
+        price:              o.price,
+        sizeUsdc:           o.sizeUsdc,
+        sizeShares:         o.sizeShares,
+        spreadFromMidCents: o.spreadFromMidCents,
+      }]);
+      logger.info(`[order-replacer] WALL BREAK REAL ${o.side} @ ${o.price.toFixed(4)} | id: ${posted.orderId}`);
+    }
+    // Resetear timer para que no re-queue inmediatamente después
+    requeueTimestamps.set(positionId, Date.now());
+    console.log(`[order-replacer] WALL BREAK REAL #${positionId} completado`);
+    return { action: 'requeued' };
+  } catch (err) {
+    logger.error('[order-replacer] Error en cancelAndRequeueOnWallBreak', err);
+    return { action: 'error', reason: String(err) };
+  }
+}

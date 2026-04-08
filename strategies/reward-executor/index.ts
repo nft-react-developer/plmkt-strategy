@@ -1,40 +1,27 @@
 // strategies/rewards-executor/index.ts
 //
-// S7: Rewards Executor — v2
+// S7: Rewards Executor — v2.1
 //
-// Correcciones basadas en errores reales de LP en Polymarket:
+// FIXES respecto a v2:
 //
-//   Error 1 — Books vacios: filtro de depth minimo por lado ($800, 5 niveles)
-//   Error 2 — Cancelar destruye Q-score: re-queue solo si NO hay muralla protegiendo
-//   Error 3 — Capital proporcional al depth: size dinamico segun liquidez del mercado
-//   Error 4 — Mercados de eventos instantaneos: lista de keywords baneados
+//   FIX 1 — Guardar clobOrderId al postear órdenes reales:
+//     Antes se llamaba orderQueries.insertMany sin pasar el orderId del CLOB,
+//     por lo que todos los registros tenían clobOrderId=null. Esto impedía
+//     detectar correctamente los fills en syncInventory.
 //
-// Tips aplicados:
-//   - Tu share del pool importa mas que el tamano del pool
-//   - Posicionate ON wall y no canceles → cada minuto sin cancelar = mas Q-score
-//   - Un spread de 1c con $79 de volumen es una trampa (ver depth, no solo spread)
+//   FIX 2 — Detectar fill inmediato (status: matched) al abrir posición:
+//     Si la primera orden sale con status 'matched', significa que se ejecutó
+//     instantáneamente (el precio de entrada coincidió con una contraparte).
+//     En ese caso cerramos la posición y cancelamos las demás órdenes para
+//     evitar el loop de hedge fallido que genera errores 400 continuos.
 //
-// Endpoint: GET clob.polymarket.com/rewards/markets/multi
-//
-// Parametros configurables (strategy_config):
-//   paperTrading              TRUE = paper, FALSE = real (default: true)
-//   maxPositions              max posiciones simultaneas (default: 5)
-//   totalCapitalUsdc          capital total disponible (default: 400)
-//   minRatePerDay             rate_per_day minimo para entrar (default: 1)
-//   minRateRetentionPct       % minimo de retencion de rate vs entrada (default: 50)
-//   minScoreThreshold         Qmin minimo para no cerrar (default: 0.001)
-//   maxPriceMoveThreshold     % movimiento de precio para salir (default: 0.15)
-//   maxSpreadCentsThreshold   spread maximo del book para entrar (default: 10)
-//   minDepthPerSideUsdc       depth minimo por lado en USDC (default: 800)
-//   minDepthLevels            niveles minimos de precio por lado (default: 5)
-//   maxVolume24hUsdc          volumen max 24h — preferir mercados tranquilos (default: 50000)
-//   wallProtectionThreshold   muralla minima para NO hacer re-queue (default: 300)
-//   requeueIntervalMinutes    cada cuantos minutos re-queuar si no hay muralla (default: 45)
-//   placementStrategy         'tight'|'mid'|'wide' — distancia al mid (default: 'mid')
-//   bannedKeywords            mercados a bannear por keyword (configurable en DB)
-//   saveBookSnapshots         guardar snapshots del book para analisis (default: true)
-//   maxDaysOpen               dias maximos abierta (default: 7)
-//   intervalSeconds           tick (default: 60)
+//   FIX 3 — Eliminar llamada a rebalanceIfNeeded:
+//     El rebalanceo activo (hedge SELL) no es compatible con la estrategia de
+//     rewards porque: (a) requiere tener shares disponibles que pueden estar
+//     comprometidos en otras órdenes, (b) el CLOB rechaza el SELL con error
+//     400 "not enough balance" si el balance ya está asignado a otras órdenes,
+//     (c) el loop de reintentos spamea el CLOB cada 5 segundos sin parar.
+//     Ver inventory-manager.ts para más detalles.
 
 import { Strategy, StrategyRunResult }                                              from '../../core/strategy.interface';
 import { CooldownManager }                                                           from '../../core/cooldown';
@@ -43,7 +30,7 @@ import { positionQueries, orderQueries, accrualQueries }                        
 import { orderBookQueries }                                                          from '../../db/queries';
 import { calcTakerFee, parseCategory }                                               from '../../utils/fees';
 import { logger }                                                                    from '../../utils/logger';
-import { syncInventory, rebalanceIfNeeded, closeInventoryPosition, getInventoryState } from '../../core/inventory-manager';
+import { syncInventory, closeInventoryPosition, getInventoryState, rebalanceWithBreakEvenHedge, clearBreakEvenHedge } from '../../core/inventory-manager';
 import { repriceIfNeeded, requeueIfNeeded, clearRepriceTracker, clearRequeueTracker } from '../../core/order-replacer';
 import { postOrder, cancelAllForMarket, verifyAuth }                                 from '../../core/clob-client';
 import { Side } from '@polymarket/clob-client';
@@ -78,87 +65,67 @@ interface ClobBook  { bids: BookLevel[]; asks: BookLevel[]; }
 interface BookAnalysis {
   bidDepthUsdc:    number;
   askDepthUsdc:    number;
-  minDepthUsdc:    number;   // el lado mas fino — el que limita (min de bid, ask)
-  maxWallUsdc:     number;   // orden mas grande en cualquier lado (muralla)
-  hasMinDepth:     boolean;  // pasa el filtro de niveles minimos
-  wallProtects:    boolean;  // hay una muralla suficientemente grande para no cancelar
+  minDepthUsdc:    number;
+  maxWallUsdc:     number;
+  hasMinDepth:     boolean;
+  wallProtects:    boolean;
 }
 
 interface ExecutorParams {
   paperTrading:             boolean;
   maxPositions:             number;
-  totalCapitalUsdc:         number;   // capital total — se reparte dinamicamente
+  totalCapitalUsdc:         number;
   minRatePerDay:            number;
   minRateRetentionPct:      number;
   minScoreThreshold:        number;
   maxPriceMoveThreshold:    number;
   maxSpreadCentsThreshold:  number;
-  minDepthPerSideUsdc:      number;   // Error 1: depth minimo por lado
-  minDepthLevels:           number;   // Error 1: niveles minimos
+  minDepthPerSideUsdc:      number;
+  minDepthLevels:           number;
   maxVolume24hUsdc:         number;
-  wallProtectionThreshold:  number;   // Error 2: muralla minima para no re-queuar
-  requeueIntervalMinutes:   number;   // Error 2: solo sin muralla
+  wallProtectionThreshold:  number;
+  requeueIntervalMinutes:   number;
   placementStrategy:        PlacementStrategy;
-  bannedKeywords:           string[]; // Error 4: keywords baneadas
+  bannedKeywords:           string[];
   saveBookSnapshots:        boolean;
   maxDaysOpen:              number;
   intervalSeconds:          number;
   clobApiBase:              string;
 }
 
-// ---- Keywords baneados por defecto (Error 4) --------------------------------
-// Mercados que resuelven en segundos o tienen dinamica imposible de salir
+// ---- Keywords baneados por defecto ------------------------------------------
 const DEFAULT_BANNED_KEYWORDS = [
-  // Eventos de precio instantaneo — resuelven en segundos
   'natural gas', 'bully', 'pump',
-  // Crypto de alta volatilidad intradiaria
   'bitcoin crash', 'btc crash', 'eth crash',
-  // Eventos binarios de noticia inmediata
   'breaking', 'live', 'right now', 'today at',
-  // Mercados de muy corto plazo
   'next hour', 'next 24h', 'next 24 hours',
-  // Tokens especificos de alta volatilidad
   'meme coin', 'memecoin', 'shitcoin',
 ];
 
-// ---- Capital dinamico (Error 3) ---------------------------------------------
-// Con $300-500 reales, el capital por posicion escala segun el depth del mercado:
-//   Mercado chico  (<$5K depth)  → hasta 20% del capital total → max share posible
-//   Mercado mediano ($5K-$30K)   → 10% del capital total
-//   Mercado grande  (>$30K)      → 5% del capital total → no dominar demasiado
-//   Siempre entre $30 y $150 para no concentrar riesgo
-function calcDynamicSize(
-  totalCapital:    number,
-  liquidityUsdc:   number,
-): number {
+// ---- Capital dinamico -------------------------------------------------------
+function calcDynamicSize(totalCapital: number, liquidityUsdc: number): number {
   let pct: number;
-  if (liquidityUsdc < 5_000)       pct = 0.20;  // mercado chico: maximo share
-  else if (liquidityUsdc < 30_000) pct = 0.10;  // mediano
-  else                              pct = 0.05;  // grande: no desperdiciar capital
-
+  if (liquidityUsdc < 5_000)       pct = 0.20;
+  else if (liquidityUsdc < 30_000) pct = 0.10;
+  else                              pct = 0.05;
   const raw = totalCapital * pct;
-  // Clampear entre $30 (minimo util) y $150 (maximo por posicion con $400-500)
   return Math.max(30, Math.min(150, raw));
 }
 
-// ---- Analisis de book (Error 1 + Error 2) -----------------------------------
+// ---- Analisis de book -------------------------------------------------------
 function analyzeBookDepth(
-  book:                   ClobBook,
-  minLevels:              number,
+  book:                    ClobBook,
+  minLevels:               number,
   wallProtectionThreshold: number,
 ): BookAnalysis {
   const levels = 10;
   const bids   = book.bids.slice(0, levels);
   const asks   = book.asks.slice(0, levels);
 
-  // Depth en USDC por lado (shares * precio para bids, shares * (1-precio) para asks)
   const bidDepthUsdc = bids.reduce((s, l) => s + Number(l.size) * Number(l.price), 0);
   const askDepthUsdc = asks.reduce((s, l) => s + Number(l.size) * (1 - Number(l.price)), 0);
-
-  // El lado mas fino es el que limita la profundidad real
   const minDepthUsdc = Math.min(bidDepthUsdc, askDepthUsdc);
 
-  // Muralla: orden mas grande en cualquier lado
   const maxBidWall  = bids.reduce((m, l) => Math.max(m, Number(l.size) * Number(l.price)), 0);
   const maxAskWall  = asks.reduce((m, l) => Math.max(m, Number(l.size) * (1 - Number(l.price))), 0);
   const maxWallUsdc = Math.max(maxBidWall, maxAskWall);
@@ -169,7 +136,7 @@ function analyzeBookDepth(
   return { bidDepthUsdc, askDepthUsdc, minDepthUsdc, maxWallUsdc, hasMinDepth, wallProtects };
 }
 
-// ---- Keyword ban (Error 4) --------------------------------------------------
+// ---- Keyword ban ------------------------------------------------------------
 function isBannedMarket(question: string, bannedKeywords: string[]): string | null {
   const q = question.toLowerCase();
   for (const kw of bannedKeywords) {
@@ -190,19 +157,19 @@ export const rewardsExecutorStrategy: Strategy = {
   defaultParams: {
     paperTrading:            true,
     maxPositions:            5,
-    totalCapitalUsdc:        400,     // para $300-500 reales, ajustar en DB
+    totalCapitalUsdc:        400,
     minRatePerDay:           1,
     minRateRetentionPct:     50,
     minScoreThreshold:       0.001,
     maxPriceMoveThreshold:   0.15,
     maxSpreadCentsThreshold: 10,
-    minDepthPerSideUsdc:     800,     // Error 1: minimo por lado
-    minDepthLevels:          5,       // Error 1: niveles minimos
+    minDepthPerSideUsdc:     800,
+    minDepthLevels:          5,
     maxVolume24hUsdc:        50_000,
-    wallProtectionThreshold: 300,     // Error 2: muralla para no re-queuar
-    requeueIntervalMinutes:  45,      // Error 2: solo si no hay muralla
+    wallProtectionThreshold: 300,
+    requeueIntervalMinutes:  45,
     placementStrategy:       'mid' as PlacementStrategy,
-    bannedKeywords:          DEFAULT_BANNED_KEYWORDS, // Error 4
+    bannedKeywords:          DEFAULT_BANNED_KEYWORDS,
     saveBookSnapshots:       true,
     maxDaysOpen:             7,
     intervalSeconds:         60,
@@ -211,10 +178,7 @@ export const rewardsExecutorStrategy: Strategy = {
 
   async run(params): Promise<StrategyRunResult> {
     const p      = params as unknown as ExecutorParams;
-    // Merge banned keywords: defaultParams + lo que venga de DB
-    const bannedKws = Array.isArray(p.bannedKeywords)
-      ? p.bannedKeywords
-      : DEFAULT_BANNED_KEYWORDS;
+    const bannedKws = Array.isArray(p.bannedKeywords) ? p.bannedKeywords : DEFAULT_BANNED_KEYWORDS;
 
     const signals: StrategyRunResult['signals'] = [];
     let positionsOpened  = 0;
@@ -245,7 +209,6 @@ export const rewardsExecutorStrategy: Strategy = {
 
       const spreadCents = bestBid && bestAsk ? (bestAsk - bestBid) * 100 : null;
 
-      // Analisis de book en cada tick (para decidir si re-queuar o no)
       const bookAnalysis = analyzeBookDepth(book, p.minDepthLevels, p.wallProtectionThreshold);
 
       // Guardar snapshot historico
@@ -371,13 +334,22 @@ export const rewardsExecutorStrategy: Strategy = {
 
       // ---- Gestion de ordenes (real trading) ---------------------------------
       if (!p.paperTrading) {
-        const inventory = await syncInventory(
+        const invState = await syncInventory(
           pos.id, pos.tokenIdYes, pos.tokenIdNo, midprice,
           { maxInventoryValueUsdc: Number(pos.sizeUsdc) * 2 },
         ).catch(() => null);
 
-        if (inventory && Math.abs(inventory.netExposure) > 0) {
-          await rebalanceIfNeeded(inventory, midprice, Number(pos.maxSpreadCents)).catch(() => {});
+        // Si hay exposición neta (fills de BUY sin cubrir), colocar LIMIT SELL
+        // al break-even en vez de cerrar a mercado → cobrar maker rebate, no pagar taker fee.
+        // La posición sigue abierta y las LP orders (BID + ASK) se recolocan abajo.
+        if (invState && invState.netExposure > 0.01) {
+          const hedgeResult = await rebalanceWithBreakEvenHedge(invState);
+          if (hedgeResult === 'hedged') {
+            console.log(
+              `[rewards_executor]   BREAK-EVEN SELL #${pos.id} | ` +
+              `SELL ${invState.netExposure.toFixed(2)} @ ${invState.avgEntryPrice.toFixed(4)} (maker rebate)`,
+            );
+          }
         }
 
         // Reprecio si el precio se movio mucho
@@ -391,7 +363,6 @@ export const rewardsExecutorStrategy: Strategy = {
         if (reprice?.action === 'repriced') {
           console.log(`[rewards_executor]   REPRICED #${pos.id} ${(reprice.oldMidprice! * 100).toFixed(1)}c -> ${(reprice.newMidprice! * 100).toFixed(1)}c`);
         } else if (!bookAnalysis.wallProtects) {
-          // Error 2: solo re-queuar si NO hay muralla protegiendo
           const requeue = await requeueIfNeeded(
             pos.id, pos.tokenIdYes,
             Number(pos.maxSpreadCents), Number(pos.sizePerSideUsdc),
@@ -406,7 +377,7 @@ export const rewardsExecutorStrategy: Strategy = {
         }
 
       } else {
-        // Paper: reprecio si se movio + re-queue periodico solo si sin muralla
+        // Paper: reprecio + re-queue periodico solo si sin muralla
         const reprice = await repriceIfNeeded(
           pos.id, pos.tokenIdYes, midprice,
           Number(pos.maxSpreadCents), Number(pos.sizePerSideUsdc),
@@ -444,7 +415,6 @@ export const rewardsExecutorStrategy: Strategy = {
         if (!market.tokens?.length || market.tokens.length < 2) continue;
         if (new Date() > new Date(market.end_date)) continue;
 
-        // Error 4: keyword ban
         const banned = isBannedMarket(market.question, bannedKws);
         if (banned) {
           console.log(`[rewards_executor]   skip "${market.question.slice(0, 40)}" — keyword ban: "${banned}"`);
@@ -459,13 +429,11 @@ export const rewardsExecutorStrategy: Strategy = {
           continue;
         }
 
-        // Filtro de volumen (mercados tranquilos)
         if (p.maxVolume24hUsdc > 0 && market.volume_24hr > p.maxVolume24hUsdc) {
           console.log(`[rewards_executor]   skip ${market.question.slice(0, 40)} — vol24h $${market.volume_24hr.toFixed(0)} > max $${p.maxVolume24hUsdc}`);
           continue;
         }
 
-        // Spread del book
         const spreadCents = Number(market.spread ?? 0) * 100;
         if (spreadCents > p.maxSpreadCentsThreshold) {
           console.log(`[rewards_executor]   skip ${market.question.slice(0, 40)} — spread ${spreadCents.toFixed(1)}c > max ${p.maxSpreadCentsThreshold}c`);
@@ -481,7 +449,6 @@ export const rewardsExecutorStrategy: Strategy = {
         const tokenNo  = market.tokens.find(t => t.outcome === 'NO')  ?? market.tokens[1];
         if (!tokenYes) continue;
 
-        // Fetchear book real para analisis de depth
         const book = await fetchBook(p.clobApiBase, tokenYes.token_id);
         if (!book) continue;
 
@@ -490,7 +457,6 @@ export const rewardsExecutorStrategy: Strategy = {
         const midprice = calcMidprice(bestBid, bestAsk);
         if (!midprice) continue;
 
-        // Error 1: analizar depth real del book
         const bookAnalysis = analyzeBookDepth(book, p.minDepthLevels, p.wallProtectionThreshold);
 
         if (!bookAnalysis.hasMinDepth) {
@@ -502,7 +468,6 @@ export const rewardsExecutorStrategy: Strategy = {
           continue;
         }
 
-        // Error 3: capital dinamico segun liquidez
         const liquidityUsdc    = Number(market.volume_24hr ?? 0);
         const sizeUsdc         = calcDynamicSize(p.totalCapitalUsdc, liquidityUsdc);
         const sizePerSide      = sizeUsdc / 2;
@@ -516,13 +481,13 @@ export const rewardsExecutorStrategy: Strategy = {
         const feeEntry  = plannedOrders.reduce((s, o) => s + calcTakerFee(o.price, category) * o.sizeUsdc, 0);
         const entrySpreadCents = bestBid && bestAsk ? (bestAsk - bestBid) * 100 : null;
 
-        // Calcular share estimado del pool
-        const totalDepth    = bookAnalysis.bidDepthUsdc + bookAnalysis.askDepthUsdc;
+        const totalDepth     = bookAnalysis.bidDepthUsdc + bookAnalysis.askDepthUsdc;
         const estimatedShare = totalDepth > 0 ? (sizeUsdc / totalDepth) * 100 : 0;
 
         const positionId = await positionQueries.open({
           paperTrading: p.paperTrading, marketId: market.condition_id,
-          marketQuestion: market.question, marketSlug: market.market_slug ?? market.slug ?? undefined, eventSlug: market.event_slug ?? undefined, tokenIdYes: tokenYes.token_id,
+          marketQuestion: market.question, marketSlug: market.market_slug ?? market.slug ?? undefined,
+          eventSlug: market.event_slug ?? undefined, tokenIdYes: tokenYes.token_id,
           tokenIdNo: tokenNo?.token_id, rewardId: String(config.id),
           dailyRewardUsdc: ratePerDay, maxSpreadCents, minSizeShares,
           rewardEndDate: new Date(config.end_date), scalingFactorC: 3.0,
@@ -532,6 +497,7 @@ export const rewardsExecutorStrategy: Strategy = {
           dualSideRequired, totalLiquidityUsdc: liquidityUsdc,
         });
 
+        // Insertar órdenes planificadas en DB (sin clobOrderId aún, se actualizan abajo)
         await orderQueries.insertMany(
           plannedOrders.map(o => ({
             positionId, paperTrading: p.paperTrading, tokenId: tokenYes.token_id,
@@ -541,13 +507,15 @@ export const rewardsExecutorStrategy: Strategy = {
         );
 
         // Real trading: colocar ordenes en el CLOB
-        // Para órdenes ASK (sell): en lugar de SELL YES (requiere tokens),
-        // colocamos BUY NO al precio complementario (1 - askPrice).
-        // Son económicamente equivalentes (YES + NO = $1) y solo necesitan USDC.
         if (!p.paperTrading) {
           const tickSizeStr = String(market.minimum_tick_size ?? 0.01) as '0.1' | '0.01' | '0.001' | '0.0001';
+
+          // Rastrear órdenes filladas inmediatamente (status: matched)
+          let immediatelyFilled = false;
+          const filledOrders: { tokenId: string; price: number; size: number }[] = [];
+
           for (const o of plannedOrders) {
-            const isSell = o.side === 'sell';
+            const isSell  = o.side === 'sell';
             const tokenId = isSell ? tokenNo.token_id  : tokenYes.token_id;
             const price   = isSell ? Math.round((1 - o.price) * 100) / 100 : o.price;
             const size    = isSell ? o.sizeUsdc / price : o.sizeShares;
@@ -559,9 +527,66 @@ export const rewardsExecutorStrategy: Strategy = {
             }).catch(err => { logger.error('[rewards_executor] postOrder failed', err); return null; });
 
             if (posted) {
-              const label = isSell ? `BUY NO @ ${price.toFixed(2)} (≡ SELL YES @ ${o.price.toFixed(2)})` : `BUY YES @ ${price.toFixed(2)}`;
-              logger.info(`[rewards_executor] Orden colocada | id: ${posted.orderId} | ${label}`);
+              const label = isSell
+                ? `BUY NO @ ${price.toFixed(2)} (≡ SELL YES @ ${o.price.toFixed(2)})`
+                : `BUY YES @ ${price.toFixed(2)}`;
+              logger.info(`[rewards_executor] Orden colocada | id: ${posted.orderId} | status: ${posted.status} | ${label}`);
+
+              await orderQueries.insertMany([{
+                positionId,
+                paperTrading:       false,
+                tokenId,
+                side:               'buy',
+                price,
+                sizeUsdc:           o.sizeUsdc,
+                sizeShares:         size,
+                spreadFromMidCents: o.spreadFromMidCents,
+                clobOrderId:        posted.orderId,
+                status:             posted.status === 'matched' ? 'filled' : 'open',
+              }]);
+
+              if (posted.status === 'matched') {
+                logger.warn(
+                  `[rewards_executor] ⚠️ Orden fillada inmediatamente (status: matched)` +
+                  ` — colocando LIMIT SELL break-even @ ${price.toFixed(4)}`,
+                );
+                immediatelyFilled = true;
+                filledOrders.push({ tokenId, price, size });
+              }
             }
+          }
+
+          // Fill inmediato: en vez de cerrar a mercado (pagar taker fee),
+          // colocar LIMIT SELL al precio de break-even (cobrar maker rebate).
+          // La posición queda ABIERTA para seguir haciendo LP con BID + ASK.
+          if (immediatelyFilled) {
+            // 1. Cancelar órdenes LP restantes (las filladas ya no están en el libro)
+            await cancelAllForMarket(tokenYes.token_id).catch(err =>
+              logger.error(`[rewards_executor] Error cancelando ordenes tras fill inmediato`, err),
+            );
+            if (tokenNo?.token_id) {
+              await cancelAllForMarket(tokenNo.token_id).catch(() => {});
+            }
+
+            // 2. Colocar LIMIT SELL al break-even para cada orden fillada
+            for (const filled of filledOrders) {
+              await postOrder({
+                tokenId: filled.tokenId,
+                price:   filled.price,
+                size:    filled.size,
+                side:    Side.SELL,
+              }).catch(err => logger.error('[rewards_executor] Error colocando break-even sell', err));
+              logger.info(
+                `[rewards_executor] Break-even SELL colocado | ` +
+                `SELL ${filled.size.toFixed(2)} @ ${filled.price.toFixed(4)} (maker rebate)`,
+              );
+            }
+
+            // 3. La posición SIGUE ABIERTA — el próximo tick recoloca LP y monitorea
+            console.log(
+              `[rewards_executor]   #${positionId} — fill inmediato | ` +
+              `break-even SELL @ ${filledOrders.map(f => f.price.toFixed(4)).join(', ')} | posicion sigue abierta`,
+            );
           }
         }
 
@@ -644,6 +669,7 @@ async function closeRealPosition(positionId: number, tokenIdYes: string, midpric
     else            await cancelAllForMarket(tokenIdYes);
     clearRepriceTracker(positionId);
     clearRequeueTracker(positionId);
+    clearBreakEvenHedge(tokenIdYes);
   } catch (err) {
     logger.error(`[rewards_executor] Error cerrando posicion real #${positionId}`, err);
   }
@@ -696,18 +722,6 @@ function buildCloseSignal(
   };
 }
 
-/**
- * Construye la URL correcta de Polymarket para un mercado.
- * Usa event_slug + market_slug cuando estan disponibles (mas preciso).
- * Formato: polymarket.com/event/{event_slug}/{market_slug}
- * O:       polymarket.com/event/{market_slug}  (mercados sin evento padre)
- */
-function buildMarketUrl(marketSlug?: string, eventSlug?: string): string | null {
-  if (!marketSlug) return null;
-  if (eventSlug) return `https://polymarket.com/event/${eventSlug}/${marketSlug}`;
-  return `https://polymarket.com/event/${marketSlug}`;
-}
-
 async function fetchBook(clobBase: string, tokenId: string): Promise<ClobBook | null> {
   try {
     const res = await fetch(`${clobBase}/book?token_id=${tokenId}`, { signal: AbortSignal.timeout(5_000) });
@@ -717,8 +731,6 @@ async function fetchBook(clobBase: string, tokenId: string): Promise<ClobBook | 
 }
 
 async function fetchCurrentRewardRate(clobBase: string, conditionId: string): Promise<number | null> {
-  // El CLOB rewards API no filtra por condition_id — hay que buscar en la lista completa
-  // Traemos todos los mercados con rewards y buscamos el que coincide
   try {
     const res  = await fetch(`${clobBase}/rewards/markets/multi?page_size=500`, { signal: AbortSignal.timeout(8_000) });
     if (!res.ok) return null;
@@ -734,7 +746,6 @@ async function fetchRewardMarkets(clobBase: string): Promise<RewardsMarket[]> {
   const data = await res.json() as RewardsMarketsResponse;
   const markets = (data.data ?? []).filter(m => m.rewards_config?.length > 0 && m.tokens?.length >= 2);
 
-  // Enriquecer con neg_risk y minimum_tick_size desde /markets endpoint
   const ids = markets.map(m => m.condition_id).join(',');
   try {
     const detailRes = await fetch(`${clobBase}/markets?condition_ids=${ids}`, { signal: AbortSignal.timeout(10_000) });

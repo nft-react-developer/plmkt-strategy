@@ -155,6 +155,9 @@ export const positionQueries = {
 
 export const orderQueries = {
 
+  // FIX: añadido clobOrderId y status opcionales para tracking de órdenes reales.
+  // - clobOrderId: ID de la orden en el CLOB, necesario para detectar fills y cancelaciones.
+  // - status: 'open' para órdenes reales recién colocadas, 'simulated' para paper (default).
   async insertMany(items: Array<{
     positionId:          number;
     paperTrading:        boolean;
@@ -164,6 +167,8 @@ export const orderQueries = {
     sizeUsdc:            number;
     sizeShares:          number;
     spreadFromMidCents?: number;
+    clobOrderId?:        string;
+    status?:             'simulated' | 'open' | 'filled' | 'cancelled';
   }>): Promise<void> {
     const db = await getDb();
     await db.insert(orders).values(
@@ -176,7 +181,9 @@ export const orderQueries = {
         sizeUsdc:           o.sizeUsdc.toFixed(2),
         sizeShares:         o.sizeShares.toFixed(6),
         spreadFromMidCents: o.spreadFromMidCents?.toFixed(4),
-        status:             o.paperTrading ? 'simulated' as const : 'open' as const,
+        // Si viene status explícito lo usamos; si no, inferimos por paperTrading
+        status:             (o.status ?? (o.paperTrading ? 'simulated' : 'open')) as 'simulated' | 'open' | 'filled' | 'cancelled',
+        clobOrderId:        o.clobOrderId ?? null,
       })),
     );
   },
@@ -187,6 +194,36 @@ export const orderQueries = {
       .select()
       .from(orders)
       .where(eq(orders.positionId, positionId))
+      .orderBy(orders.placedAt);
+  },
+
+  // FIX: nuevo método para actualizar el status de una orden por clobOrderId.
+  // Necesario para marcar órdenes como filled/cancelled cuando el CLOB las resuelve.
+  async updateStatusByClobId(
+    clobOrderId: string,
+    status: 'open' | 'filled' | 'cancelled',
+    filledPrice?: number,
+  ): Promise<void> {
+    const db = await getDb();
+    await db
+      .update(orders)
+      .set({
+        status,
+        ...(filledPrice !== undefined ? { filledPrice: filledPrice.toFixed(6), filledAt: new Date() } : {}),
+      })
+      .where(eq(orders.clobOrderId, clobOrderId));
+  },
+
+  // FIX: obtener órdenes abiertas reales por posición (para verificar fills).
+  async getOpenForPosition(positionId: number) {
+    const db = await getDb();
+    return db
+      .select()
+      .from(orders)
+      .where(and(
+        eq(orders.positionId, positionId),
+        eq(orders.status, 'open'),
+      ))
       .orderBy(orders.placedAt);
   },
 };

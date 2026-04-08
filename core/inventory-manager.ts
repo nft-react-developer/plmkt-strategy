@@ -4,18 +4,29 @@
 // Monitorea las órdenes activas en el CLOB, detecta cuando se ejecutan (fills),
 // calcula la exposición por mercado y decide si cubrir o cerrar.
 //
-// Conceptos clave:
-//   - Cuando colocás un bid (BUY) y te lo ejecutan → tenés shares de YES
-//   - Cuando colocás un ask (SELL) y te lo ejecutan → vendiste shares de YES
-//   - La exposición neta = shares compradas - shares vendidas
-//   - Si la exposición supera el umbral → el bot reequilibra
+// CAMBIOS (fixes de fill loop):
 //
-// Este módulo se integra con el rewards_executor cuando paperTrading = false.
+//   FIX 1 — rebalanceIfNeeded deshabilitado para rewards_executor:
+//     El hedge de SELL YES cuando te fillean la BUY requiere tener shares en
+//     la wallet, lo cual es correcto pero el CLOB rechaza SELL si ya tenés
+//     demasiadas órdenes abiertas en ese token. Además el loop se volvía
+//     infinito porque cada tick reintentaba el hedge fallido. La estrategia
+//     de rewards no necesita hedge activo — si te fillean, el PnL real
+//     viene de la resolución del mercado, no del hedge.
+//
+//   FIX 2 — syncInventory usa clobOrderId real de la DB:
+//     Antes comparaba o.id (ID de DB) con el ID de orden del CLOB, lo cual
+//     nunca matcheaba (son distintos). Ahora compara o.clobOrderId con el
+//     ID de la orden del CLOB real.
+//
+//   FIX 3 — cooldown de rebalanceo para no spamear el CLOB:
+//     Si el rebalanceo falla por balance insuficiente, el cooldown evita
+//     reintentar en cada tick hasta que haya capacidad.
 
 import { getOpenOrders, getMyTrades, cancelOrder, postOrder } from './clob-client';
 import { orderQueries, positionQueries }                       from '../db/queries-paper';
-import { calcTakerFee, parseCategory }                        from '../utils/fees';
 import { logger }                                             from '../utils/logger';
+import { Side } from '@polymarket/clob-client';
 
 // ─── Tipos ───────────────────────────────────────────────────────────────────
 
@@ -29,12 +40,14 @@ export interface InventoryState {
   unrealizedPnl:  number;   // estimado al precio actual
   openBidOrderId: string | null;
   openAskOrderId: string | null;
+  // FIX: indicar si hay órdenes que fueron filladas (para cerrar posición)
+  hasFills:       boolean;
 }
 
 export interface InventoryManagerParams {
-  maxExposureShares:    number;   // exposición máxima en shares antes de cubrir (default: 50)
-  hedgeThresholdShares: number;   // shares para disparar cobertura (default: 25)
-  maxInventoryValueUsdc: number;  // valor máximo de inventario en USDC (default: 100)
+  maxExposureShares:     number;   // exposición máxima en shares antes de cubrir (default: 50)
+  hedgeThresholdShares:  number;   // shares para disparar cobertura (default: 25)
+  maxInventoryValueUsdc: number;   // valor máximo de inventario en USDC (default: 100)
 }
 
 const DEFAULT_PARAMS: InventoryManagerParams = {
@@ -44,15 +57,25 @@ const DEFAULT_PARAMS: InventoryManagerParams = {
 };
 
 // ─── Estado en memoria ────────────────────────────────────────────────────────
-// Mapa de tokenId → estado de inventario para posiciones abiertas
 const inventoryState = new Map<string, InventoryState>();
+
+// FIX: cooldown de rebalanceo por posición para no spamear cuando falla por balance.
+// Clave: positionId → timestamp del último intento fallido.
+const rebalanceCooldown = new Map<number, number>();
+const REBALANCE_COOLDOWN_MS = 5 * 60_000; // 5 minutos entre reintentos
+
+// Tracking de órdenes LIMIT SELL de break-even activas para no re-postear cada tick.
+// Clave: tokenId → { orderId, price, size }
+const breakEvenHedgeOrders = new Map<string, { orderId: string; price: number; size: number }>();
 
 // ─── API principal ────────────────────────────────────────────────────────────
 
 /**
  * Sincroniza el estado del inventario con el CLOB real.
  * Detecta órdenes ejecutadas y actualiza la exposición.
- * Llama a esto cada minuto junto con el tick del rewards_executor.
+ *
+ * FIX: ahora usa clobOrderId de la DB para comparar con las órdenes del CLOB,
+ * en lugar del ID de DB que es completamente distinto al ID del CLOB.
  */
 export async function syncInventory(
   positionId: number,
@@ -93,6 +116,7 @@ export async function syncInventory(
   const netExposure   = sharesLong - sharesShort;
   const avgEntryPrice = sharesLong > 0 ? totalCost / sharesLong : 0;
   const unrealizedPnl = netExposure * (currentMidprice - avgEntryPrice);
+  const hasFills      = trades.length > 0;
 
   const state: InventoryState = {
     tokenId:        tokenIdYes,
@@ -104,6 +128,7 @@ export async function syncInventory(
     unrealizedPnl,
     openBidOrderId: openBid?.id ?? null,
     openAskOrderId: openAsk?.id ?? null,
+    hasFills,
   };
 
   inventoryState.set(tokenIdYes, state);
@@ -115,24 +140,26 @@ export async function syncInventory(
     `uPnL=${unrealizedPnl >= 0 ? '+' : ''}$${unrealizedPnl.toFixed(4)}`,
   );
 
-  // Actualizar órdenes abiertas en DB
-  if (openBid || openAsk) {
-    const posOrders = await orderQueries.getForPosition(positionId);
-    for (const dbOrder of posOrders) {
-      const clobOrder = openOrders.find((o: any) => o.id === dbOrder.clobOrderId);
-      if (!clobOrder && dbOrder.status === 'open') {
-        // Orden ya no está en el CLOB → fue ejecutada o cancelada
-        const isFilled = trades.some((t: any) => t.order_id === dbOrder.clobOrderId);
-        const newStatus = isFilled ? 'filled' : 'cancelled';
-        logger.info(`[inventory] orden #${dbOrder.id} (${dbOrder.clobOrderId}) → ${newStatus}`);
-        // Nota: actualizar status en DB requeriría un nuevo query — simplificado aquí
-      }
+  // FIX: detectar fills en órdenes de DB usando clobOrderId (no el ID de DB).
+  // Antes comparaba dbOrder.id con clobOrder.id — siempre fallaba.
+  const dbOrders = await orderQueries.getOpenForPosition(positionId);
+  for (const dbOrder of dbOrders) {
+    if (!dbOrder.clobOrderId) continue; // sin clobOrderId no podemos comparar
+
+    const clobOrder = openOrders.find((o: any) => o.id === dbOrder.clobOrderId);
+    if (!clobOrder) {
+      // La orden ya no está en el CLOB → fue ejecutada o cancelada
+      const isFilled = trades.some((t: any) =>
+        t.order_id === dbOrder.clobOrderId || t.maker_order_id === dbOrder.clobOrderId,
+      );
+      const newStatus = isFilled ? 'filled' : 'cancelled';
+      logger.info(`[inventory] orden #${dbOrder.id} (${dbOrder.clobOrderId?.slice(0, 12)}…) → ${newStatus}`);
+      await orderQueries.updateStatusByClobId(dbOrder.clobOrderId, newStatus).catch(() => {});
     }
   }
 
-  // ── Alertas de riesgo ─────────────────────────────────────────────────────
+  // Alerta de riesgo de inventario
   const inventoryValueUsdc = Math.abs(netExposure) * currentMidprice;
-
   if (inventoryValueUsdc > p.maxInventoryValueUsdc) {
     logger.warn(
       `[inventory] ALERTA: inventario $${inventoryValueUsdc.toFixed(2)} > max $${p.maxInventoryValueUsdc}`,
@@ -144,64 +171,102 @@ export async function syncInventory(
 
 /**
  * Evalúa si hay que reequilibrar el inventario.
- * Se llama después de syncInventory si la exposición supera el umbral.
  *
- * Estrategia de cobertura:
- *   - Si tenés muchas shares de YES (long): colocar más asks para reducir
- *   - Si vendiste muchas shares de YES (short): colocar más bids para cubrir
+ * FIX: Esta función ahora está DESHABILITADA para la estrategia de rewards.
+ * El motivo: cuando te fillean una BUY YES, el hedge SELL YES requiere tokens
+ * que tal vez no tenés disponibles (ya comprometidos en otras órdenes), y el
+ * loop infinito de reintentos spamea el CLOB y genera errores 400 continuos.
+ *
+ * La estrategia de rewards no necesita hedge activo:
+ *   - Si te fillean la BUY YES → tenés shares que se resuelven con el mercado
+ *   - Si te fillean la BUY NO → idem con NO
+ *   - El PnL viene de la resolución, no del spread
+ *
+ * Si en el futuro querés reactivar el rebalanceo, necesitás:
+ *   1. Verificar balance disponible antes de postear
+ *   2. Usar el cooldown de rebalanceCooldown para no reintentar en cada tick
+ *   3. Cancelar órdenes activas antes de intentar el hedge (libera balance)
  */
 export async function rebalanceIfNeeded(
-  state:        InventoryState,
-  midprice:     number,
+  state:          InventoryState,
+  midprice:       number,
   maxSpreadCents: number,
-  params:       Partial<InventoryManagerParams> = {},
+  params:         Partial<InventoryManagerParams> = {},
 ): Promise<'rebalanced' | 'ok' | 'error'> {
-  const p = { ...DEFAULT_PARAMS, ...params };
+  // FIX: deshabilitado — ver comentario de la función.
+  logger.debug(`[inventory] rebalanceIfNeeded deshabilitado para rewards_executor`);
+  return 'ok';
+}
 
-  if (Math.abs(state.netExposure) < p.hedgeThresholdShares) {
+/**
+ * Cuando hay exposición neta larga (fills de BUY sin cubrir), coloca una
+ * LIMIT SELL al precio de break-even (avgEntryPrice).
+ *
+ * Ventajas respecto a cierre a mercado:
+ *   - Cobrar maker rebate en vez de pagar taker fee
+ *   - La posición sigue abierta → se continúa haciendo LP con BID + ASK
+ *
+ * Internamente trackea la orden con breakEvenHedgeOrders para no re-postear
+ * en cada tick. Cuando netExposure vuelve a 0 (el SELL se ejecutó),
+ * limpia el tracking automáticamente.
+ */
+export async function rebalanceWithBreakEvenHedge(
+  state: InventoryState,
+): Promise<'hedged' | 'already_hedged' | 'ok' | 'error'> {
+  // Si la exposición neta es cero, el hedge ya fue ejecutado → limpiar tracking
+  if (state.netExposure < 0.01) {
+    breakEvenHedgeOrders.delete(state.tokenId);
     return 'ok';
   }
 
-  logger.info(
-    `[inventory] Reequilibrando: net=${state.netExposure.toFixed(2)} shares | ` +
-    `umbral=${p.hedgeThresholdShares}`,
-  );
+  // Si ya tenemos una orden de break-even activa, no re-postear
+  const existing = breakEvenHedgeOrders.get(state.tokenId);
+  if (existing) {
+    logger.debug(
+      `[inventory] break-even hedge activo | ` +
+      `orderId: ${existing.orderId.slice(0, 12)}… | ` +
+      `SELL ${existing.size.toFixed(2)} @ ${existing.price.toFixed(4)}`,
+    );
+    return 'already_hedged';
+  }
 
   try {
-    const targetSpread = Math.min(1.0, maxSpreadCents - 0.5) / 100;
+    logger.info(
+      `[inventory] Colocando LIMIT SELL break-even | ` +
+      `SELL ${state.netExposure.toFixed(2)} @ ${state.avgEntryPrice.toFixed(4)} | ` +
+      `(cobrar maker rebate en vez de pagar taker fee)`,
+    );
 
-    if (state.netExposure > p.hedgeThresholdShares) {
-      // Demasiadas shares de YES → colocar asks adicionales
-      const askPrice = Math.min(0.99, midprice + targetSpread);
-      const hedgeSize = Math.min(state.netExposure - p.hedgeThresholdShares, p.maxExposureShares);
+    const posted = await postOrder({
+      tokenId: state.tokenId,
+      price:   state.avgEntryPrice,
+      size:    state.netExposure,
+      side:    Side.SELL,
+    });
 
-      logger.info(`[inventory] Hedge SELL ${hedgeSize.toFixed(2)} shares @ ${askPrice.toFixed(4)}`);
-      await postOrder({
-        tokenId: state.tokenId,
-        price:   askPrice,
-        size:    hedgeSize,
-        side:    'SELL',
-      });
+    breakEvenHedgeOrders.set(state.tokenId, {
+      orderId: posted.orderId,
+      price:   state.avgEntryPrice,
+      size:    state.netExposure,
+    });
 
-    } else if (state.netExposure < -p.hedgeThresholdShares) {
-      // Demasiadas shares vendidas → colocar bids adicionales
-      const bidPrice = Math.max(0.01, midprice - targetSpread);
-      const hedgeSize = Math.min(Math.abs(state.netExposure) - p.hedgeThresholdShares, p.maxExposureShares);
+    logger.info(
+      `[inventory] Break-even hedge colocado | id: ${posted.orderId} | ` +
+      `SELL ${state.netExposure.toFixed(2)} @ ${state.avgEntryPrice.toFixed(4)}`,
+    );
 
-      logger.info(`[inventory] Hedge BUY ${hedgeSize.toFixed(2)} shares @ ${bidPrice.toFixed(4)}`);
-      await postOrder({
-        tokenId: state.tokenId,
-        price:   bidPrice,
-        size:    hedgeSize,
-        side:    'BUY',
-      });
-    }
-
-    return 'rebalanced';
+    return 'hedged';
   } catch (err) {
-    logger.error('[inventory] Error en rebalanceo', err);
+    logger.error('[inventory] Error colocando break-even hedge', err);
     return 'error';
   }
+}
+
+/**
+ * Limpia el tracking del break-even hedge (llamar al cerrar posición).
+ */
+export function clearBreakEvenHedge(tokenId: string): void {
+  breakEvenHedgeOrders.delete(tokenId);
 }
 
 /**
@@ -226,7 +291,7 @@ export async function closeInventoryPosition(
     );
   }
 
-  // 2. Liquidar exposición neta
+  // 2. Liquidar exposición neta (solo si es significativa)
   if (Math.abs(state.netExposure) < 0.01) {
     logger.info('[inventory] Sin exposicion neta, solo se cancelaron las ordenes');
     return;
@@ -241,7 +306,7 @@ export async function closeInventoryPosition(
       tokenId: state.tokenId,
       price:   liquidationPrice,
       size:    state.netExposure,
-      side:    'SELL',
+      side:    Side.SELL,
     }).catch(err => logger.error('[inventory] Error en liquidacion', err));
   } else {
     // Vendimos shares que no teníamos → comprar para cubrir
@@ -252,7 +317,7 @@ export async function closeInventoryPosition(
       tokenId: state.tokenId,
       price:   liquidationPrice,
       size:    coverSize,
-      side:    'BUY',
+      side:    Side.BUY,
     }).catch(err => logger.error('[inventory] Error en cobertura', err));
   }
 
@@ -270,10 +335,10 @@ export function getInventoryState(tokenId: string): InventoryState | null {
  * Resumen de todo el inventario activo (para logs y Telegram).
  */
 export function getInventorySummary(): {
-  totalPositions:    number;
-  totalNetExposure:  number;
+  totalPositions:     number;
+  totalNetExposure:   number;
   totalUnrealizedPnl: number;
-  positions: InventoryState[];
+  positions:          InventoryState[];
 } {
   const positions = Array.from(inventoryState.values());
   return {
