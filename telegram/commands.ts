@@ -7,6 +7,8 @@
 //   /current_rewards   — PnL actual de posiciones de rewards (paper + real)
 //   /status            — Estado de todas las estrategias
 //   /positions         — Posiciones abiertas del rewards executor
+//   /pause [id]        — Pausa una estrategia (o todas si no se especifica)
+//   /resume [id]       — Reactiva una estrategia (o todas si no se especifica)
 //   /help              — Lista de comandos
 //
 // Integrar en index.ts:
@@ -59,6 +61,12 @@ export function startCommandListener(): void {
           break;
         case '/status':
           await handleStatus(chatId);
+          break;
+        case '/pause':
+          await handlePauseResume(chatId, text, false);
+          break;
+        case '/resume':
+          await handlePauseResume(chatId, text, true);
           break;
         case '/help':
           await handleHelp(chatId);
@@ -301,6 +309,27 @@ async function handlePositions(chatId: string): Promise<void> {
   await sendCommand(chatId, msg);
 }
 
+async function handlePauseResume(chatId: string, text: string, enable: boolean): Promise<void> {
+  const args       = text.trim().split(/\s+/);
+  const strategyId = args[1] ?? null;
+  const action     = enable ? 'activada' : 'pausada';
+  const icon       = enable ? '▶' : '⏸';
+
+  if (strategyId) {
+    const existing = await strategyQueries.getById(strategyId);
+    if (!existing) {
+      await sendCommand(chatId, `❌ Estrategia <code>${strategyId}</code> no encontrada`);
+      return;
+    }
+    await strategyQueries.setEnabled(strategyId, enable);
+    await sendCommand(chatId, `${icon} Estrategia <code>${strategyId}</code> ${action}`);
+  } else {
+    const all = await strategyQueries.getAll();
+    await Promise.all(all.map(s => strategyQueries.setEnabled(s.strategyId, enable)));
+    await sendCommand(chatId, `${icon} Todas las estrategias (${all.length}) ${action}`);
+  }
+}
+
 async function handleStatus(chatId: string): Promise<void> {
   const configs = await strategyQueries.getAll();
 
@@ -324,10 +353,14 @@ async function handleHelp(chatId: string): Promise<void> {
   const msg = [
     `🤖 <b>Comandos disponibles</b>`,
     '',
-    `/current_rewards — PnL actual de rewards (paper + real)`,
-    `/positions       — Lista de posiciones abiertas`,
-    `/status          — Estado de todas las estrategias`,
-    `/help            — Este mensaje`,
+    `/current_rewards   — PnL actual de rewards (paper + real)`,
+    `/positions         — Lista de posiciones abiertas`,
+    `/status            — Estado de todas las estrategias`,
+    `/pause [id]        — Pausa una estrategia (o todas)`,
+    `/resume [id]       — Reactiva una estrategia (o todas)`,
+    `/help              — Este mensaje`,
+    '',
+    `<i>Ejemplo: /pause rewards_executor</i>`,
   ].join('\n');
 
   await sendCommand(chatId, msg);
