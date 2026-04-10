@@ -34,6 +34,7 @@ import { syncInventory, closeInventoryPosition, getInventoryState, rebalanceWith
 import { repriceIfNeeded, requeueIfNeeded, clearRepriceTracker, clearRequeueTracker } from '../../core/order-replacer';
 import { postOrder, cancelAllForMarket, verifyAuth, getOpenOrders }                  from '../../core/clob-client';
 import { Side } from '@polymarket/clob-client';
+import { url } from 'node:inspector';
 
 // ---- Tipos ------------------------------------------------------------------
 
@@ -56,8 +57,9 @@ interface RewardsMarket {
   tokens:               RewardToken[];
   volume_24hr:          number;
   rewards_config:       RewardsConfig[];
-  neg_risk?:            boolean;
-  minimum_tick_size?:   number;
+  neg_risk?:              boolean;
+  minimum_tick_size?:     number;
+  market_competitiveness?: number;
 }
 interface RewardsMarketsResponse { limit: number; count: number; next_cursor: string; data: RewardsMarket[]; }
 interface BookLevel { price: string; size: string; }
@@ -91,6 +93,9 @@ interface ExecutorParams {
   maxDaysOpen:              number;
   intervalSeconds:          number;
   clobApiBase:              string;
+  maxCompetitiveness?:      number;
+  fetchMinRatePerDay:       number;
+  fetchMaxMinSize:          number;
 }
 
 // ---- Keywords baneados por defecto ------------------------------------------
@@ -174,6 +179,9 @@ export const rewardsExecutorStrategy: Strategy = {
     maxDaysOpen:             7,
     intervalSeconds:         60,
     clobApiBase:             'https://clob.polymarket.com',
+    maxCompetitiveness:      undefined,
+    fetchMinRatePerDay:      200,
+    fetchMaxMinSize:         50,
   } satisfies ExecutorParams,
 
   async run(params): Promise<StrategyRunResult> {
@@ -244,16 +252,27 @@ export const rewardsExecutorStrategy: Strategy = {
           side: o.side.toLowerCase() as 'buy' | 'sell',
           price: o.price, sizeShares: o.size,
         }));
+        console.log(
+          `[rewards_executor]   CLOB liveOrders YES #${pos.id}: ` +
+          (invStateEarly.liveOrders.length
+            ? invStateEarly.liveOrders.map(o => `${o.side}@${(o.price * 100).toFixed(1)}c`).join(', ')
+            : '(ninguna)'),
+        );
         if (pos.tokenIdNo) {
           const liveNo = await getOpenOrders(pos.tokenIdNo);
-          ordersNo = liveNo
-            .filter((o: any) => o.status === 'LIVE')
-            .map((o: any) => ({
-              tokenId: pos.tokenIdNo!,
-              side: String(o.side).toLowerCase() as 'buy' | 'sell',
-              price: Number(o.price),
-              sizeShares: Number(o.size ?? o.original_size ?? 0),
-            }));
+          const liveNoFiltered = liveNo.filter((o: any) => o.status === 'LIVE');
+          ordersNo = liveNoFiltered.map((o: any) => ({
+            tokenId: pos.tokenIdNo!,
+            side: String(o.side).toLowerCase() as 'buy' | 'sell',
+            price: Number(o.price),
+            sizeShares: Number(o.size ?? o.original_size ?? 0),
+          }));
+          console.log(
+            `[rewards_executor]   CLOB liveOrders NO  #${pos.id}: ` +
+            (liveNoFiltered.length
+              ? liveNoFiltered.map((o: any) => `${o.side}@${(Number(o.price) * 100).toFixed(1)}c`).join(', ')
+              : '(ninguna)'),
+          );
         } else {
           ordersNo = [];
         }
@@ -265,6 +284,7 @@ export const rewardsExecutorStrategy: Strategy = {
         ordersNo = posOrders
           .filter(o => o.tokenId === pos.tokenIdNo)
           .map(o => ({ tokenId: o.tokenId, side: o.side, price: Number(o.price), sizeShares: Number(o.sizeShares) }));
+        console.log(`[rewards_executor]   DB orders (paper) #${pos.id}: ${posOrders.length} ordenes`);
       }
 
       const score = calcSampleScore(
@@ -294,7 +314,8 @@ export const rewardsExecutorStrategy: Strategy = {
         ` mid=${(midprice * 100).toFixed(1)}c` +
         ` spread=${spreadCents?.toFixed(1) ?? '?'}c` +
         ` depth=${bookAnalysis.minDepthUsdc.toFixed(0)}$ wall=${bookAnalysis.maxWallUsdc.toFixed(0)}$` +
-        ` Qmin=${score.qmin.toFixed(4)} +$${score.rewardUsdc.toFixed(6)}` +
+        ` Qmin=${score.qmin.toFixed(4)} qne=${score.qne.toFixed(4)} qno=${score.qno.toFixed(4)}` +
+        ` +$${score.rewardUsdc.toFixed(6)}` +
         ` | ${(pos.marketQuestion ?? '').slice(0, 35)}`,
       );
 
@@ -392,10 +413,22 @@ export const rewardsExecutorStrategy: Strategy = {
         ).catch(() => null);
 
         // Detectar si alguna orden activa quedó fuera del rango de rewards.
-        // Usa liveOrders del CLOB (fuente de verdad) en vez de DB.
+        // Combina YES (liveOrders) y NO (ordersNo convertido a equivalente YES).
+        // Las órdenes NO se comparan como 1-price porque YES+NO=1.
         const maxSpreadDecimal = Number(pos.maxSpreadCents) / 100;
-        const ordersOutOfRange = (invState?.liveOrders ?? []).some(o =>
+        const liveYes = invState?.liveOrders ?? [];
+        // ordersNo usa precio del token NO — convertir a equivalente YES para la comparación
+        const liveNoAsYes = ordersNo.map(o => ({ ...o, price: 1 - o.price }));
+        const liveAll = [...liveYes, ...liveNoAsYes];
+        const ordersOutOfRange = liveAll.some(o =>
           Math.abs(o.price - midprice) > maxSpreadDecimal,
+        );
+        console.log(
+          `[rewards_executor]   outOfRange check #${pos.id}` +
+          ` maxSpread=${(maxSpreadDecimal * 100).toFixed(1)}c mid=${(midprice * 100).toFixed(1)}c` +
+          ` liveYES=[${liveYes.map(o => `${o.side}@${(o.price * 100).toFixed(1)}c`).join(', ') || 'ninguna'}]` +
+          ` liveNO=[${liveNoAsYes.map(o => `@${(o.price * 100).toFixed(1)}c(≡YES) dist=${(Math.abs(o.price - midprice) * 100).toFixed(2)}c`).join(', ') || 'ninguna'}]` +
+          ` outOfRange=${ordersOutOfRange}`,
         );
 
         if (reprice?.action === 'repriced') {
@@ -443,7 +476,7 @@ export const rewardsExecutorStrategy: Strategy = {
     console.log(`[rewards_executor] slots disponibles: ${slotsAvailable}/${p.maxPositions}`);
 
     if (slotsAvailable > 0) {
-      const markets = await fetchRewardMarkets(p.clobApiBase).catch(err => {
+      const markets = await fetchRewardMarkets(p.clobApiBase, p.fetchMinRatePerDay, p.fetchMaxMinSize).catch(err => {
         logger.error('[rewards_executor] fetchRewardMarkets failed', err);
         return [];
       });
@@ -456,9 +489,12 @@ export const rewardsExecutorStrategy: Strategy = {
         if (!market.tokens?.length || market.tokens.length < 2) continue;
         if (new Date() > new Date(market.end_date)) continue;
 
+        const rate0 = Number(market.rewards_config[0]?.rate_per_day ?? 0);
+        console.log(`[rewards_executor] >> analizando: "${market.question.slice(0, 70)}" | rate $${rate0}/d | minSize ${market.rewards_min_size} | spread ${market.spread}`);
+
         const banned = isBannedMarket(market.question, bannedKws);
         if (banned) {
-          console.log(`[rewards_executor]   skip "${market.question.slice(0, 40)}" — keyword ban: "${banned}"`);
+          console.log(`[rewards_executor]   skip "${market.question.slice(0, 60)}" — keyword ban: "${banned}"`);
           continue;
         }
 
@@ -466,18 +502,28 @@ export const rewardsExecutorStrategy: Strategy = {
         const ratePerDay = Number(config.rate_per_day ?? 0);
 
         if (ratePerDay < p.minRatePerDay) {
-          console.log(`[rewards_executor]   skip ${market.question.slice(0, 40)} — rate $${ratePerDay}/d < min $${p.minRatePerDay}`);
+          console.log(`[rewards_executor]   skip ${market.question.slice(0, 60)} — rate $${ratePerDay}/d < min $${p.minRatePerDay}`);
           continue;
         }
 
+        if (p.maxCompetitiveness !== undefined && market.market_competitiveness !== undefined) {
+          if (market.market_competitiveness > p.maxCompetitiveness) {
+            console.log(
+              `[rewards_executor]   skip ${market.question.slice(0, 60)}` +
+              ` — competitiveness=${market.market_competitiveness.toFixed(2)} > max=${p.maxCompetitiveness}`,
+            );
+            continue;
+          }
+        }
+
         if (p.maxVolume24hUsdc > 0 && market.volume_24hr > p.maxVolume24hUsdc) {
-          console.log(`[rewards_executor]   skip ${market.question.slice(0, 40)} — vol24h $${market.volume_24hr.toFixed(0)} > max $${p.maxVolume24hUsdc}`);
+          console.log(`[rewards_executor]   skip ${market.question.slice(0, 60)} — vol24h $${market.volume_24hr.toFixed(0)} > max $${p.maxVolume24hUsdc}`);
           continue;
         }
 
         const spreadCents = Number(market.spread ?? 0) * 100;
         if (spreadCents > p.maxSpreadCentsThreshold) {
-          console.log(`[rewards_executor]   skip ${market.question.slice(0, 40)} — spread ${spreadCents.toFixed(1)}c > max ${p.maxSpreadCentsThreshold}c`);
+          console.log(`[rewards_executor]   skip ${market.question.slice(0, 60)} — spread ${spreadCents}c > max ${p.maxSpreadCentsThreshold}c`);
           continue;
         }
 
@@ -501,11 +547,11 @@ export const rewardsExecutorStrategy: Strategy = {
         const bookAnalysis = analyzeBookDepth(book, p.minDepthLevels, p.wallProtectionThreshold);
 
         if (!bookAnalysis.hasMinDepth) {
-          console.log(`[rewards_executor]   skip ${market.question.slice(0, 40)} — menos de ${p.minDepthLevels} niveles`);
+          console.log(`[rewards_executor]   skip ${market.question.slice(0, 60)} — menos de ${p.minDepthLevels} niveles`);
           continue;
         }
         if (bookAnalysis.minDepthUsdc < p.minDepthPerSideUsdc) {
-          console.log(`[rewards_executor]   skip ${market.question.slice(0, 40)} — depth $${bookAnalysis.minDepthUsdc.toFixed(0)} < min $${p.minDepthPerSideUsdc}`);
+          console.log(`[rewards_executor]   skip ${market.question.slice(0, 60)} — depth $${bookAnalysis.minDepthUsdc.toFixed(0)} < min $${p.minDepthPerSideUsdc}`);
           continue;
         }
 
@@ -663,13 +709,16 @@ export const rewardsExecutorStrategy: Strategy = {
         await cooldown.stamp(cooldownKey);
         positionsOpened++;
 
+        const compStr = market.market_competitiveness !== undefined
+          ? ` | comp=${market.market_competitiveness.toFixed(2)}`
+          : '';
         console.log(
           `[rewards_executor]   ABIERTA #${positionId} — ${market.question.slice(0, 45)}` +
           ` | $${sizeUsdc.toFixed(0)} USDC (${estimatedShare.toFixed(1)}% share)` +
           ` | rate=$${ratePerDay}/d | mid=${(midprice * 100).toFixed(1)}c` +
           ` | maxSpread=${maxSpreadCents}c | wall=$${bookAnalysis.maxWallUsdc.toFixed(0)}` +
           ` | depth=$${bookAnalysis.minDepthUsdc.toFixed(0)}` +
-          ` | placement=${p.placementStrategy}`,
+          ` | placement=${p.placementStrategy}${compStr}`,
         );
 
         signals.push({
@@ -809,27 +858,98 @@ async function fetchCurrentRewardRate(clobBase: string, conditionId: string): Pr
   } catch { return null; }
 }
 
-async function fetchRewardMarkets(clobBase: string): Promise<RewardsMarket[]> {
-  const res  = await fetch(`${clobBase}/rewards/markets/multi?order_by=rate_per_day&position=DESC&page_size=100`, { signal: AbortSignal.timeout(10_000) });
-  if (!res.ok) throw new Error(`CLOB rewards API ${res.status}`);
-  const data = await res.json() as RewardsMarketsResponse;
-  const markets = (data.data ?? []).filter(m => m.rewards_config?.length > 0 && m.tokens?.length >= 2);
+async function fetchRewardMarkets(clobBase: string, fetchMinRate: number, fetchMaxMinSize: number): Promise<RewardsMarket[]> {
+  const LAST_CURSOR = 'LTE=';
 
-  const ids = markets.map(m => m.condition_id).join(',');
-  try {
-    const detailRes = await fetch(`${clobBase}/markets?condition_ids=${ids}`, { signal: AbortSignal.timeout(10_000) });
-    if (detailRes.ok) {
-      const detailData = await detailRes.json() as { data: Array<{ condition_id: string; neg_risk: boolean; minimum_tick_size: number }> };
-      const detailMap = new Map((detailData.data ?? []).map(d => [d.condition_id, d]));
-      for (const m of markets) {
-        const d = detailMap.get(m.condition_id);
-        if (d) {
-          m.neg_risk          = d.neg_risk ?? false;
-          m.minimum_tick_size = d.minimum_tick_size ?? 0.01;
-        }
+  // ── Step 1: paginar /rewards/markets/current?sponsored=true ──────────────
+  // Endpoint ligero: sin joins de estadísticas, sin sort costoso.
+  // Devuelve: condition_id, rewards_min_size, rewards_max_spread, total_daily_rate, rewards_config
+  interface CurrentEntry {
+    condition_id:        string;
+    rewards_min_size:    number;
+    rewards_max_spread:  number;
+    total_daily_rate?:   number;
+    rewards_config?:     Array<{ rate_per_day?: number; end_date?: string; id?: number; [k: string]: unknown }>;
+  }
+  interface CurrentResponse { limit: number; count: number; next_cursor: string; data: CurrentEntry[]; }
+
+  const qualifiedMap = new Map<string, { rewards_min_size: number; rewards_max_spread: number; rate_per_day: number; reward_end_date: string; reward_id: number }>();
+  let cursor: string | null = null;
+
+  do {
+    const url = new URL(`${clobBase}/rewards/markets/current`);
+    url.searchParams.set('sponsored', 'true');
+    if (cursor) url.searchParams.set('next_cursor', cursor);
+
+    const res = await fetch(url.toString(), { signal: AbortSignal.timeout(10_000) });
+    if (!res.ok) {
+      const body = await res.text().catch(() => '');
+      throw new Error(`CLOB rewards/current ${res.status}: ${body}`);
+    }
+    const data = await res.json() as CurrentResponse;
+
+    for (const m of (data.data ?? [])) {
+      const rate = Number(m.total_daily_rate ?? m.rewards_config?.[0]?.rate_per_day ?? 0);
+      if (rate >= fetchMinRate && Number(m.rewards_min_size) <= fetchMaxMinSize) {
+        qualifiedMap.set(m.condition_id, {
+          rewards_min_size:  Number(m.rewards_min_size),
+          rewards_max_spread: Number(m.rewards_max_spread),
+          rate_per_day:      rate,
+          reward_end_date:   String(m.rewards_config?.[0]?.end_date ?? ''),
+          reward_id:         Number(m.rewards_config?.[0]?.id ?? 0),
+        });
       }
     }
-  } catch { /* si falla el enrich, seguimos con defaults */ }
+    cursor = (data.next_cursor === LAST_CURSOR || !data.next_cursor) ? null : data.next_cursor;
+  } while (cursor);
 
+  console.log(`[rewards_executor] fetchRewardMarkets: ${qualifiedMap.size} mercados calificados (rate≥${fetchMinRate}, minSize≤${fetchMaxMinSize})`);
+  if (qualifiedMap.size === 0) return [];
+
+  // ── Step 2: enriquecer desde /markets?condition_ids= ────────────────────
+  // Devuelve: question, tokens, spread, end_date_iso, neg_risk, minimum_tick_size
+  interface ClobMarketDetail {
+    condition_id:      string;
+    question:          string;
+    tokens:            RewardToken[];
+    neg_risk:          boolean;
+    minimum_tick_size: number;
+    spread:            number;
+    end_date_iso?:     string;
+    end_date?:         string;
+  }
+
+  const markets: RewardsMarket[] = [];
+
+  for (const id of qualifiedMap.keys()) {
+    try {
+      const detailRes = await fetch(`${clobBase}/markets/${id}`, { signal: AbortSignal.timeout(10_000) });
+      if (!detailRes.ok) continue;
+      const d = await detailRes.json() as ClobMarketDetail;
+
+      const q = qualifiedMap.get(d.condition_id);
+      if (!q || !d.tokens || d.tokens.length < 2) continue;
+      // Descartar mercados resueltos: algún token tiene winner=true o precio extremo (0 o 1)
+      if (d.tokens.some((t: RewardToken & { winner?: boolean }) => t.winner === true)) continue;
+      if (d.tokens.some((t: RewardToken) => Number(t.price) === 0 || Number(t.price) === 1)) continue;
+
+      const endDate = d.end_date_iso ?? d.end_date ?? '';
+      markets.push({
+        condition_id:       d.condition_id,
+        question:           d.question ?? '',
+        rewards_max_spread: q.rewards_max_spread,
+        rewards_min_size:   q.rewards_min_size,
+        spread:             Number(d.spread ?? 0),
+        end_date:           endDate,
+        tokens:             d.tokens,
+        volume_24hr:        0,
+        rewards_config:     [{ id: q.reward_id, asset_address: '', start_date: '', end_date: q.reward_end_date || endDate, rate_per_day: q.rate_per_day, total_rewards: 0 }],
+        neg_risk:           d.neg_risk ?? false,
+        minimum_tick_size:  d.minimum_tick_size ?? 0.01,
+      });
+    } catch { /* si falla un mercado, seguimos con el siguiente */ }
+  }
+
+  console.log(`[rewards_executor] fetchRewardMarkets: ${markets.length} mercados listos`);
   return markets;
 }
