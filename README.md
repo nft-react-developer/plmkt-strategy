@@ -161,6 +161,53 @@ WHERE outcome IS NOT NULL
 GROUP BY strategy_id;
 ```
 
+## rewards_executor — Parámetros de configuración
+
+Estrategia de market making en mercados con rewards de Polymarket. Coloca órdenes BUY en ambos lados (YES y NO) para ganar rewards por proveer liquidez.
+
+| Parámetro | Default | Descripción |
+|-----------|---------|-------------|
+| `paperTrading` | `true` | Modo simulado. En `false` postea órdenes reales al CLOB |
+| `maxPositions` | `5` | Posiciones abiertas simultáneas máximas |
+| `totalCapitalUsdc` | `400` | Capital total disponible. El tamaño por posición se calcula dinámicamente según la liquidez del mercado |
+| `minRatePerDay` | `1` | Tasa mínima de rewards (USDC/día) para mantener una posición abierta |
+| `minRateRetentionPct` | `50` | Si la tasa actual cae por debajo de este % de la tasa de entrada, cierra la posición |
+| `minScoreThreshold` | `0.001` | Score Qmin mínimo para no cerrar por `score_too_low` |
+| `maxPriceMoveThreshold` | `0.15` | Movimiento máximo de precio desde la entrada (15%) antes de cerrar |
+| `maxSpreadCentsThreshold` | `10` | Spread máximo del mercado en centavos para abrir una nueva posición |
+| `minDepthPerSideUsdc` | `800` | Profundidad mínima por lado (USDC) en el order book para abrir |
+| `minDepthLevels` | `5` | Niveles mínimos en el order book para abrir |
+| `maxVolume24hUsdc` | `50000` | Volumen máximo 24h. Mercados más líquidos tienen más competencia en rewards |
+| `wallProtectionThreshold` | `300` | Tamaño mínimo de muralla (USDC). Si existe una muralla de ese tamaño, no se hace requeue |
+| `requeueIntervalMinutes` | `45` | Minutos mínimos entre requeueues. Evita spamear el CLOB cancelando y recolocando continuamente |
+| `placementStrategy` | `'mid'` | Dónde colocar las órdenes: `tight` (1¢ del mid, score máximo), `mid` (50% del maxSpread), `wide` (80% del maxSpread, menos riesgo de fill) |
+| `bannedKeywords` | `[...]` | Keywords en el título del mercado para excluir automáticamente |
+| `saveBookSnapshots` | `true` | Guardar snapshot del order book en DB en cada tick |
+| `maxDaysOpen` | `7` | Días máximos antes de cerrar una posición por expiración |
+| `intervalSeconds` | `60` | Intervalo en segundos entre ticks |
+| `clobApiBase` | `https://clob.polymarket.com` | URL base del CLOB de Polymarket |
+| `maxCompetitiveness` | `undefined` | Si se define, excluye mercados con `market_competitiveness` mayor a este valor |
+| `fetchMinRatePerDay` | `200` | Filtro al buscar mercados: solo trae los con rate ≥ este valor (USDC/día) |
+| `fetchMaxMinSize` | `50` | Filtro al buscar mercados: excluye los con `min_size` mayor a este valor (shares) |
+| `earningsCheckDelayMinutes` | `5` | Minutos desde apertura antes de considerar `earning_percentage=0` como fuera de rango. El endpoint `/rewards/user/markets` de Polymarket devuelve 0 al inicio aunque las órdenes estén bien posicionadas |
+
+### Ejemplo de configuración en DB
+
+```sql
+UPDATE strategy_config
+SET params = '{
+  "paperTrading": false,
+  "maxPositions": 3,
+  "totalCapitalUsdc": 300,
+  "fetchMinRatePerDay": 100,
+  "placementStrategy": "tight",
+  "earningsCheckDelayMinutes": 10
+}'
+WHERE strategy_id = 'rewards_executor';
+```
+
+---
+
 ## Variables de entorno
 
 ```env

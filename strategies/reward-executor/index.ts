@@ -32,7 +32,7 @@ import { calcTakerFee, parseCategory }                                          
 import { logger }                                                                    from '../../utils/logger';
 import { syncInventory, closeInventoryPosition, getInventoryState, rebalanceWithBreakEvenHedge, clearBreakEvenHedge } from '../../core/inventory-manager';
 import { repriceIfNeeded, requeueIfNeeded, clearRepriceTracker, clearRequeueTracker } from '../../core/order-replacer';
-import { postOrder, cancelAllForMarket, verifyAuth, getOpenOrders }                  from '../../core/clob-client';
+import { postOrder, cancelAllForMarket, verifyAuth, getOpenOrders, fetchUserEarningsForMarkets } from '../../core/clob-client';
 import { Side } from '@polymarket/clob-client';
 import { url } from 'node:inspector';
 
@@ -50,7 +50,6 @@ interface RewardsMarket {
   market_slug?:         string;
   event_slug?:          string;
   slug?:                string;
-  rewards_max_spread:   number;
   rewards_min_size:     number;
   spread:               number;
   end_date:             string;
@@ -93,9 +92,10 @@ interface ExecutorParams {
   maxDaysOpen:              number;
   intervalSeconds:          number;
   clobApiBase:              string;
-  maxCompetitiveness?:      number;
-  fetchMinRatePerDay:       number;
-  fetchMaxMinSize:          number;
+  maxCompetitiveness?:          number;
+  fetchMinRatePerDay:           number;
+  fetchMaxMinSize:              number;
+  earningsCheckDelayMinutes:    number;
 }
 
 // ---- Keywords baneados por defecto ------------------------------------------
@@ -154,6 +154,10 @@ function isBannedMarket(question: string, bannedKeywords: string[]): string | nu
 
 const cooldown = new CooldownManager('rewards_executor');
 
+// Cache del health check de earnings — se refresca cada earningsCheckDelayMinutes
+let lastEarningsFetchAt = 0;
+let cachedEarningsMap: Map<string, number> | null = null;
+
 export const rewardsExecutorStrategy: Strategy = {
   id:          'rewards_executor',
   name:        'Rewards Executor',
@@ -179,9 +183,10 @@ export const rewardsExecutorStrategy: Strategy = {
     maxDaysOpen:             7,
     intervalSeconds:         60,
     clobApiBase:             'https://clob.polymarket.com',
-    maxCompetitiveness:      undefined,
-    fetchMinRatePerDay:      200,
-    fetchMaxMinSize:         50,
+    maxCompetitiveness:          undefined,
+    fetchMinRatePerDay:          200,
+    fetchMaxMinSize:             50,
+    earningsCheckDelayMinutes:   5,
   } satisfies ExecutorParams,
 
   async run(params): Promise<StrategyRunResult> {
@@ -196,6 +201,23 @@ export const rewardsExecutorStrategy: Strategy = {
 
     const mode = p.paperTrading ? 'PAPER' : 'REAL';
     console.log(`\n[rewards_executor] -- tick ${new Date().toISOString()} [${mode}] --`);
+
+    // ---- 0. Health check: earning_percentage por mercado (real trading only) ---
+    // Se refresca cada earningsCheckDelayMinutes (no en cada tick) para no spamear la API.
+    // Si earning_percentage = 0 tras earningsCheckDelayMinutes → las órdenes están fuera de rango.
+    if (!p.paperTrading) {
+      const staleSince = Date.now() - lastEarningsFetchAt;
+      const refreshIntervalMs = p.earningsCheckDelayMinutes * 60_000;
+      if (staleSince >= refreshIntervalMs) {
+        const userEarnings = await fetchUserEarningsForMarkets().catch(() => null);
+        if (userEarnings) {
+          cachedEarningsMap = new Map(userEarnings.map(e => [e.condition_id, e.earning_percentage]));
+          lastEarningsFetchAt = Date.now();
+          console.log(`[rewards_executor] earningsMap refrescado: ${cachedEarningsMap.size} mercados`);
+        }
+      }
+    }
+    const earningsMap = p.paperTrading ? null : cachedEarningsMap;
 
     // ---- 1. Monitorear posiciones abiertas ----------------------------------
     const openPositions = await positionQueries.getOpen(p.paperTrading);
@@ -423,26 +445,39 @@ export const rewardsExecutorStrategy: Strategy = {
         const ordersOutOfRange = liveAll.some(o =>
           Math.abs(o.price - midprice) > maxSpreadDecimal,
         );
+        // Health check vía API de Polymarket: earning_percentage = 0 tras N minutos → fuera de rango
+        const minutesOpen     = (Date.now() - (pos.openedAt?.getTime() ?? 0)) / 60_000;
+        const earningPct      = earningsMap?.get(pos.marketId) ?? null;
+        const earningsOutOfRange = (
+          earningPct !== null &&
+          earningPct === 0 &&
+          minutesOpen > p.earningsCheckDelayMinutes
+        );
+
+        const isOutOfRange = ordersOutOfRange || earningsOutOfRange;
+
         console.log(
           `[rewards_executor]   outOfRange check #${pos.id}` +
           ` maxSpread=${(maxSpreadDecimal * 100).toFixed(1)}c mid=${(midprice * 100).toFixed(1)}c` +
           ` liveYES=[${liveYes.map(o => `${o.side}@${(o.price * 100).toFixed(1)}c`).join(', ') || 'ninguna'}]` +
           ` liveNO=[${liveNoAsYes.map(o => `@${(o.price * 100).toFixed(1)}c(≡YES) dist=${(Math.abs(o.price - midprice) * 100).toFixed(2)}c`).join(', ') || 'ninguna'}]` +
-          ` outOfRange=${ordersOutOfRange}`,
+          ` outOfRange=${ordersOutOfRange} earningPct=${earningPct !== null ? earningPct.toFixed(4) : 'n/a'} earningsOOR=${earningsOutOfRange}`,
         );
 
         if (reprice?.action === 'repriced') {
           console.log(`[rewards_executor]   REPRICED #${pos.id} ${(reprice.oldMidprice! * 100).toFixed(1)}c -> ${(reprice.newMidprice! * 100).toFixed(1)}c`);
-        } else if (!bookAnalysis.wallProtects || ordersOutOfRange) {
+        } else if (!bookAnalysis.wallProtects || isOutOfRange) {
           const requeue = await requeueIfNeeded(
             pos.id, pos.tokenIdYes,
             Number(pos.maxSpreadCents), Number(pos.sizePerSideUsdc),
             pos.dualSideRequired ?? false, midprice,
-            { requeueIntervalMinutes: p.requeueIntervalMinutes, paperTrading: false, forceIfOutOfRange: ordersOutOfRange },
+            { requeueIntervalMinutes: p.requeueIntervalMinutes, paperTrading: false, forceIfOutOfRange: isOutOfRange },
           ).catch(() => null);
           if (requeue?.action === 'requeued') {
-            const reason = ordersOutOfRange && bookAnalysis.wallProtects
-              ? 'ordenes fuera de rango (muralla ignorada)'
+            const reason = isOutOfRange && bookAnalysis.wallProtects
+              ? earningsOutOfRange
+                ? `earning=0 tras ${minutesOpen.toFixed(0)}min (muralla ignorada)`
+                : 'ordenes fuera de rango (muralla ignorada)'
               : 'sin muralla';
             console.log(`[rewards_executor]   REQUEUE #${pos.id} (${reason})`);
           }
@@ -490,7 +525,7 @@ export const rewardsExecutorStrategy: Strategy = {
         if (new Date() > new Date(market.end_date)) continue;
 
         const rate0 = Number(market.rewards_config[0]?.rate_per_day ?? 0);
-        console.log(`[rewards_executor] >> analizando: "${market.question.slice(0, 70)}" | rate $${rate0}/d | minSize ${market.rewards_min_size} | spread ${market.spread}`);
+        console.log(`[rewards_executor] >> analizando: "${market.question.slice(0, 70)}" | condition_id: ${market.condition_id} | rate $${rate0}/d | minSize ${market.rewards_min_size} | spread ${market.spread}`);
 
         const banned = isBannedMarket(market.question, bannedKws);
         if (banned) {
@@ -558,11 +593,23 @@ export const rewardsExecutorStrategy: Strategy = {
         const liquidityUsdc    = Number(market.volume_24hr ?? 0);
         const sizeUsdc         = calcDynamicSize(p.totalCapitalUsdc, liquidityUsdc);
         const sizePerSide      = sizeUsdc / 2;
-        const maxSpreadCents   = Number(market.rewards_max_spread ?? 3);
+        // Math.floor: la API devuelve 2.5¢ pero Polymarket aplica ±2¢ internamente.
+        // Truncar al entero inferior evita que órdenes en el límite queden sin detectar.
+        const maxSpreadCents   = Math.floor(Number(market.spread ?? 2));
         const minSizeShares    = Number(market.rewards_min_size   ?? 0);
         const dualSideRequired = midprice < 0.10 || midprice > 0.90;
 
-        const plannedOrders = calcOrderPrices(midprice, maxSpreadCents, sizePerSide, dualSideRequired, p.placementStrategy);
+        // Si el capital no alcanza para cumplir minSizeShares, ajustar sizePerSide al mínimo necesario
+        // precio más alto posible = bidPrice ≈ midprice, así que estimamos con midprice
+        const minSizeUsdc = minSizeShares > 0 ? minSizeShares * midprice : 0;
+        const effectiveSizePerSide = minSizeUsdc > sizePerSide ? minSizeUsdc : sizePerSide;
+
+        if (minSizeShares > 0 && effectiveSizePerSide > p.totalCapitalUsdc / 2) {
+          console.log(`[rewards_executor]   skip ${market.question.slice(0, 60)} — minShares ${minSizeShares} requiere $${minSizeUsdc.toFixed(0)}/lado > capital disponible`);
+          continue;
+        }
+
+        const plannedOrders = calcOrderPrices(midprice, maxSpreadCents, effectiveSizePerSide, dualSideRequired, p.placementStrategy);
 
         const category  = parseCategory(null);
         const feeEntry  = plannedOrders.reduce((s, o) => s + calcTakerFee(o.price, category) * o.sizeUsdc, 0);
@@ -599,6 +646,7 @@ export const rewardsExecutorStrategy: Strategy = {
 
           // Rastrear órdenes filladas inmediatamente (status: matched)
           let immediatelyFilled = false;
+          let ordersPostedCount = 0;
           const filledOrders: { tokenId: string; price: number; size: number }[] = [];
 
           for (const o of plannedOrders) {
@@ -615,6 +663,7 @@ export const rewardsExecutorStrategy: Strategy = {
             }).catch(err => { logger.error('[rewards_executor] postOrder failed', err); return null; });
 
             if (posted) {
+              ordersPostedCount++;
               const label = isSell
                 ? `BUY NO @ ${price.toFixed(2)} (≡ SELL YES @ ${o.price.toFixed(2)})`
                 : `BUY YES @ ${price.toFixed(2)}`;
@@ -656,6 +705,14 @@ export const rewardsExecutorStrategy: Strategy = {
                 break;
               }
             }
+          }
+
+          // Si ninguna orden se colocó exitosamente → cerrar posición en DB
+          if (ordersPostedCount === 0) {
+            logger.error(`[rewards_executor] #${positionId} — ninguna orden colocada, cerrando posicion`);
+            await positionQueries.close(positionId, 'manual');
+            positionsClosed++;
+            continue;
           }
 
           // Fill inmediato: en vez de cerrar a mercado (pagar taker fee),
@@ -914,7 +971,19 @@ async function fetchRewardMarkets(clobBase: string, fetchMinRate: number, fetchM
     tokens:            RewardToken[];
     neg_risk:          boolean;
     minimum_tick_size: number;
-    spread:            number;
+    rewards_config: 
+        {
+          asset_address: string,
+          start_date: string,
+          end_date: string,
+          id: number,
+          rate_per_day: number,
+          total_rewards: number,
+          total_days: number
+        }[]
+      ,
+    rewards_max_spread: number,
+    rewards_min_size: number,
     end_date_iso?:     string;
     end_date?:         string;
   }
@@ -937,9 +1006,8 @@ async function fetchRewardMarkets(clobBase: string, fetchMinRate: number, fetchM
       markets.push({
         condition_id:       d.condition_id,
         question:           d.question ?? '',
-        rewards_max_spread: q.rewards_max_spread,
         rewards_min_size:   q.rewards_min_size,
-        spread:             Number(d.spread ?? 0),
+        spread:             Number(d.rewards_max_spread ?? 0),
         end_date:           endDate,
         tokens:             d.tokens,
         volume_24hr:        0,

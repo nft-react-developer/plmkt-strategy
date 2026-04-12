@@ -1,6 +1,6 @@
 # TODO: Detección confiable de órdenes fuera del rango de rewards
 
-## Estado: SIN RESOLVER
+## Estado: RESUELTO
 
 ## Síntoma
 
@@ -64,7 +64,38 @@ Pero la orden visualmente aparece fuera del área sombreada de rewards en la UI.
 4. **Revisar la documentación oficial** de la fórmula de rewards de Polymarket
    - https://docs.polymarket.com/#rewards
 
+## Nueva pista: endpoint raw rewards por mercado
+
+Ver imagen adjunta: mercado Tesla (TSLA) Up or Down on April 13?
+- Rewards: $200, Max Spread: ±3¢, Min Shares: 50
+- UI muestra la orden marcada fuera del rango de rewards (reloj rojo en 47¢)
+
+Investigar endpoint:
+https://docs.polymarket.com/api-reference/rewards/get-raw-rewards-for-a-specific-market
+
+Una vez abierta la posición, consultar este endpoint para verificar si nuestra orden
+está siendo recompensada. Si score = 0 o no aparecemos → estamos out of range → forzar requeue.
+
+Este sería el método más directo y confiable: usar el dato real de Polymarket
+en lugar de recalcularlo internamente.
+
+## Solución implementada
+
+### Capa 1: `Math.floor` en `maxSpreadCents`
+Al abrir una posición, `maxSpreadCents` se guarda con `Math.floor(rewards_max_spread)`.
+Esto convierte `2.5¢ → 2¢`, alineando el threshold interno con lo que la UI de Polymarket muestra.
+- Archivo: `strategies/reward-executor/index.ts`
+- La detección tick-by-tick (`ordersOutOfRange`) ya existía y ahora usa el threshold correcto.
+
+### Capa 2: Health check vía `/rewards/user/markets`
+Al inicio de cada tick, se llama a `fetchUserEarningsForMarkets()` (una sola vez por tick).
+Para cada posición abierta, si `earning_percentage = 0` después de `earningsCheckDelayMinutes` (default: 5),
+se considera `earningsOutOfRange = true` y se fuerza un requeue.
+- Archivo: `core/clob-client.ts` — función `fetchUserEarningsForMarkets()`
+- Archivo: `strategies/reward-executor/index.ts` — variable `earningsMap` + check por posición
+
+El log ahora incluye: `earningPct=0.0000 earningsOOR=true` para detectar fácilmente el problema.
+
 ## Impacto
 
-Mientras no esté resuelto, el bot puede mantener órdenes que no ganan rewards
-sin detectarlo, perdiendo tiempo y oportunidad de reposicionarse.
+Resuelto. El bot ahora detecta y corrige órdenes fuera del rango de rewards en cada tick.

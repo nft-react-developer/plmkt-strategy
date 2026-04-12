@@ -161,6 +161,26 @@ export async function getMyTrades(tokenId?: string): Promise<any[]> {
 }
 
 /**
+ * Devuelve el earning_percentage por mercado para todos los mercados activos del día.
+ * Usa el método nativo del SDK (getUserEarningsAndMarketsConfig) que gestiona
+ * la firma L2 y el parámetro signature_type correctamente.
+ * Si earning_percentage = 0 después de N minutos → las órdenes están fuera del rango de rewards.
+ */
+export async function fetchUserEarningsForMarkets(): Promise<
+  Array<{ condition_id: string; earning_percentage: number }> | null
+> {
+  try {
+    const client  = getClobClient();
+    const results = await (client as any).getUserEarningsAndMarketsConfig();
+    if (!Array.isArray(results)) return null;
+    return results as Array<{ condition_id: string; earning_percentage: number }>;
+  } catch (err) {
+    logger.warn(`[clob-client] fetchUserEarningsForMarkets error: ${err instanceof Error ? err.message : String(err)}`);
+    return null;
+  }
+}
+
+/**
  * Verifica que las credenciales son válidas.
  * Útil para hacer un health check al arrancar.
  */

@@ -265,7 +265,7 @@ function mergeParams(
   try {
     const dbParams = JSON.parse(dbParamsJson ?? '{}');
     return { ...defaults, ...dbParams };
-  } catch {
-    return { ...defaults };
+  } catch (err) {
+    throw new Error(`params JSON inválido en DB — corregir antes de continuar: ${err instanceof Error ? err.message : String(err)}`);
   }
 }
