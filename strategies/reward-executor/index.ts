@@ -226,7 +226,10 @@ export const rewardsExecutorStrategy: Strategy = {
     for (const pos of openPositions) {
       samplesProcessed++;
 
-      const book = await fetchBook(p.clobApiBase, pos.tokenIdYes);
+      const [book, lastTradePrice] = await Promise.all([
+        fetchBook(p.clobApiBase, pos.tokenIdYes),
+        fetchLastTradePrice(p.clobApiBase, pos.tokenIdYes),
+      ]);
       if (!book) {
         console.log(`[rewards_executor]   WARNING #${pos.id} sin book`);
         continue;
@@ -317,6 +320,14 @@ export const rewardsExecutorStrategy: Strategy = {
         Number(pos.dailyRewardUsdc),
       );
 
+      // inRange: hay órdenes activas dentro del spread de rewards respecto al lastPrice
+      const priceRef = lastTradePrice ?? midprice;
+      const maxSpread = Number(pos.maxSpreadCents);
+      const inRange =
+        ordersYes.some(o => Math.abs(o.price - priceRef) * 100 < maxSpread) ||
+        ordersNo.some(o => Math.abs(o.price - (1 - priceRef)) * 100 < maxSpread);
+      score.inRange = inRange;
+
       await accrualQueries.insert({
         positionId: pos.id, paperTrading: pos.paperTrading, midprice,
         bestBid: bestBid ?? undefined, bestAsk: bestAsk ?? undefined,
@@ -373,15 +384,15 @@ export const rewardsExecutorStrategy: Strategy = {
       }
 
       // Score bajo
-      if (!score.inRange && score.qmin < p.minScoreThreshold) {
-        console.log(`[rewards_executor]   #${pos.id} CERRADA: score_too_low Qmin=${score.qmin.toFixed(6)}`);
-        await positionQueries.close(pos.id, 'score_too_low');
-        if (!p.paperTrading) await closeRealPosition(pos.id, pos.tokenIdYes, midprice);
-        else { clearRepriceTracker(pos.id); clearRequeueTracker(pos.id); }
-        positionsClosed++;
-        signals.push(buildCloseSignal(pos, 'score_too_low', midprice, score, bookAnalysis));
-        continue;
-      }
+      // if (!score.inRange) {
+      //   console.log(`[rewards_executor]   #${pos.id} CERRADA: score_too_low Qmin=${score.qmin.toFixed(6)}`);
+      //   await positionQueries.close(pos.id, 'score_too_low');
+      //   if (!p.paperTrading) await closeRealPosition(pos.id, pos.tokenIdYes, midprice);
+      //   else { clearRepriceTracker(pos.id); clearRequeueTracker(pos.id); }
+      //   positionsClosed++;
+      //   signals.push(buildCloseSignal(pos, 'score_too_low', midprice, score, bookAnalysis));
+      //   continue;
+      // }
 
       // Precio movido
       const entryMid   = Number(pos.entryMidprice);
@@ -454,7 +465,7 @@ export const rewardsExecutorStrategy: Strategy = {
           minutesOpen > p.earningsCheckDelayMinutes
         );
 
-        const isOutOfRange = ordersOutOfRange || earningsOutOfRange;
+        const isOutOfRange = !score.inRange;
 
         console.log(
           `[rewards_executor]   outOfRange check #${pos.id}` +
@@ -467,20 +478,30 @@ export const rewardsExecutorStrategy: Strategy = {
         if (reprice?.action === 'repriced') {
           console.log(`[rewards_executor]   REPRICED #${pos.id} ${(reprice.oldMidprice! * 100).toFixed(1)}c -> ${(reprice.newMidprice! * 100).toFixed(1)}c`);
         } else if (!bookAnalysis.wallProtects || isOutOfRange) {
-          const requeue = await requeueIfNeeded(
-            pos.id, pos.tokenIdYes,
-            Number(pos.maxSpreadCents), Number(pos.sizePerSideUsdc),
-            pos.dualSideRequired ?? false, midprice,
-            { requeueIntervalMinutes: p.requeueIntervalMinutes, paperTrading: false, forceIfOutOfRange: isOutOfRange },
-          ).catch(() => null);
-          if (requeue?.action === 'requeued') {
-            const reason = isOutOfRange && bookAnalysis.wallProtects
-              ? earningsOutOfRange
-                ? `earning=0 tras ${minutesOpen.toFixed(0)}min (muralla ignorada)`
-                : 'ordenes fuera de rango (muralla ignorada)'
-              : 'sin muralla';
-            console.log(`[rewards_executor]   REQUEUE #${pos.id} (${reason})`);
-          }
+          // const requeue = await requeueIfNeeded(
+          //   pos.id, pos.tokenIdYes,
+          //   Number(pos.maxSpreadCents), Number(pos.sizePerSideUsdc),
+          //   pos.dualSideRequired ?? false, midprice,
+          //   { requeueIntervalMinutes: p.requeueIntervalMinutes, paperTrading: false, forceIfOutOfRange: isOutOfRange },
+          // ).catch(() => null);
+          await positionQueries.close(pos.id, "manual");
+          await cancelAllForMarket(pos.tokenIdYes).catch(err =>
+              logger.error(`[rewards_executor] Cancel tokenId Yes ${pos.tokenIdYes}`, err),
+            );
+            if (pos.tokenIdNo){
+              await cancelAllForMarket(pos.tokenIdNo).catch(err =>
+              logger.error(`[rewards_executor] Cancel tokenId No ${pos.tokenIdNo}`, err),
+              );
+            }
+            
+          // if (requeue?.action === 'requeued') {
+          //   const reason = isOutOfRange && bookAnalysis.wallProtects
+          //     ? earningsOutOfRange
+          //       ? `earning=0 tras ${minutesOpen.toFixed(0)}min (muralla ignorada)`
+          //       : 'ordenes fuera de rango (muralla ignorada)'
+          //     : 'sin muralla';
+          //   console.log(`[rewards_executor]   REQUEUE #${pos.id} (${reason})`);
+          // }
         } else {
           console.log(`[rewards_executor]   HOLD #${pos.id} — muralla $${bookAnalysis.maxWallUsdc.toFixed(0)} protege, ordenes en rango`);
         }
@@ -601,9 +622,9 @@ export const rewardsExecutorStrategy: Strategy = {
         const minSizeShares    = Number(market.rewards_min_size   ?? 0);
         const dualSideRequired = midprice < 0.10 || midprice > 0.90;
 
-        // Si el capital no alcanza para cumplir minSizeShares, ajustar sizePerSide al mínimo necesario
-        // precio más alto posible = bidPrice ≈ midprice, así que estimamos con midprice
-        const minSizeUsdc = minSizeShares > 0 ? minSizeShares * midprice : 0;
+        // Ajustar sizePerSide para garantizar minSizeShares en ambos lados (YES y NO)
+        // El lado más caro en USDC es el que tiene precio más alto → max(midprice, 1-midprice)
+        const minSizeUsdc = minSizeShares > 0 ? minSizeShares * Math.max(midprice, 1 - midprice) : 0;
         const effectiveSizePerSide = minSizeUsdc > sizePerSide ? minSizeUsdc : sizePerSide;
 
         if (minSizeShares > 0 && effectiveSizePerSide > p.totalCapitalUsdc / 2) {
@@ -657,7 +678,8 @@ export const rewardsExecutorStrategy: Strategy = {
             const isSell  = o.side === 'sell';
             const tokenId = isSell ? tokenNo.token_id  : tokenYes.token_id;
             const price   = isSell ? Math.round((1 - o.price) * 100) / 100 : o.price;
-            const size    = isSell ? o.sizeUsdc / price : o.sizeShares;
+            const rawSize = isSell ? o.sizeUsdc / price : o.sizeShares;
+            const size    = minSizeShares > 0 ? Math.max(rawSize, minSizeShares) : rawSize;
 
             let posted: Awaited<ReturnType<typeof postOrder>> | null = null;
             try {
