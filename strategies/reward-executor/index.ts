@@ -62,7 +62,7 @@ interface RewardsMarket {
 }
 interface RewardsMarketsResponse { limit: number; count: number; next_cursor: string; data: RewardsMarket[]; }
 interface BookLevel { price: string; size: string; }
-interface ClobBook  { bids: BookLevel[]; asks: BookLevel[]; last_trade_price?: string; }
+interface ClobBook  { bids: BookLevel[]; asks: BookLevel[]; }
 interface BookAnalysis {
   bidDepthUsdc:    number;
   askDepthUsdc:    number;
@@ -570,12 +570,15 @@ export const rewardsExecutorStrategy: Strategy = {
         const tokenNo  = market.tokens.find(t => t.outcome === 'NO')  ?? market.tokens[1];
         if (!tokenYes) continue;
 
-        const book = await fetchBook(p.clobApiBase, tokenYes.token_id);
+        const [book, lastTradePrice] = await Promise.all([
+          fetchBook(p.clobApiBase, tokenYes.token_id),
+          fetchLastTradePrice(p.clobApiBase, tokenYes.token_id),
+        ]);
         if (!book) continue;
 
         const bestBid   = book.bids[0] ? Number(book.bids[0].price) : null;
         const bestAsk   = book.asks[0] ? Number(book.asks[0].price) : null;
-        const lastPrice = book.last_trade_price ? Number(book.last_trade_price) : null;
+        const lastPrice = lastTradePrice;
         const midprice  = calcMidprice(bestBid, bestAsk);
         if (!midprice) continue;
 
@@ -658,6 +661,12 @@ export const rewardsExecutorStrategy: Strategy = {
 
             let posted: Awaited<ReturnType<typeof postOrder>> | null = null;
             try {
+              console.log('postOrder',{
+                tokenId, price, size, side: Side.BUY,
+                negRisk:  market.neg_risk ?? false,
+                tickSize: tickSizeStr,
+                postOnly: true,  // garantiza entrada como maker → cobra rebate, no paga taker fee
+              })
               posted = await postOrder({
                 tokenId, price, size, side: Side.BUY,
                 negRisk:  market.neg_risk ?? false,
@@ -911,6 +920,17 @@ async function fetchBook(clobBase: string, tokenId: string): Promise<ClobBook | 
     const res = await fetch(`${clobBase}/book?token_id=${tokenId}`, { signal: AbortSignal.timeout(5_000) });
     if (!res.ok) return null;
     return res.json() as Promise<ClobBook>;
+  } catch { return null; }
+}
+
+async function fetchLastTradePrice(clobBase: string, tokenId: string): Promise<number | null> {
+  try {
+    const res = await fetch(`${clobBase}/last-trade-price?token_id=${tokenId}`, { signal: AbortSignal.timeout(5_000) });
+    if (!res.ok) return null;
+    const data = await res.json() as { price: string; side: string };
+    // side === "" significa que no hubo trades, el API devuelve 0.5 por defecto
+    if (!data.side) return null;
+    return Number(data.price);
   } catch { return null; }
 }
 
