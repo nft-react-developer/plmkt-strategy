@@ -45,14 +45,14 @@ export async function startRunner() {
     scheduleStrategy(strategy.id, params);
   }
 
-  scheduleWalletSync();
+  // scheduleWalletSync();
   scheduleDailyReport();
   scheduleOutcomeResolver(); // corre cada noche a las 03:00 UTC
   logger.info('✅ Runner started');
 }
 
 export async function stopRunner() {
-  for (const { timer } of activeTimers.values()) clearInterval(timer);
+  for (const { timer } of activeTimers.values()) clearTimeout(timer);
   activeTimers.clear();
 
   for (const strategy of STRATEGIES) {
@@ -72,13 +72,27 @@ function scheduleStrategy(strategyId: string, params: Record<string, unknown>) {
   const strategy    = STRATEGIES.find(s => s.id === strategyId);
   if (!strategy) return;
 
-  // Ejecutar inmediatamente y luego cada intervalSec
-  runStrategy(strategy.id, params);
+  // Usar setTimeout recursivo en lugar de setInterval para garantizar que el siguiente
+  // tick no empiece hasta que el anterior haya terminado. Esto evita ticks concurrentes
+  // que generan posiciones duplicadas cuando un tick tarda más que el intervalo.
+  function scheduleNext() {
+    const timer = setTimeout(async () => {
+      await runStrategy(strategyId, params);
+      if (activeTimers.has(strategyId)) scheduleNext();
+    }, intervalSec * 1000);
+    activeTimers.set(strategyId, { strategyId, timer });
+  }
 
-  const timer = setInterval(() => runStrategy(strategy.id, params), intervalSec * 1000);
-  activeTimers.set(strategyId, { strategyId, timer });
+  // Ejecutar inmediatamente y luego cada intervalSec (sin solapamiento)
+  runStrategy(strategy.id, params).then(() => {
+    if (activeTimers.has(strategyId)) scheduleNext();
+  });
 
-  logger.info(`⏱  [${strategyId}] scheduled every ${intervalSec}s`);
+  // Registrar con un timer dummy para que disableStrategy pueda detectar la estrategia
+  // antes de que termine la primera ejecución
+  activeTimers.set(strategyId, { strategyId, timer: null as any });
+
+  logger.info(`⏱  [${strategyId}] scheduled every ${intervalSec}s (sequential)`);
 }
 
 async function runStrategy(strategyId: string, params: Record<string, unknown>) {
@@ -244,7 +258,7 @@ export async function disableStrategy(strategyId: string) {
   await strategyQueries.setEnabled(strategyId, false);
   const entry = activeTimers.get(strategyId);
   if (entry) {
-    clearInterval(entry.timer);
+    clearTimeout(entry.timer);
     activeTimers.delete(strategyId);
   }
   logger.info(`⏸  [${strategyId}] disabled`);

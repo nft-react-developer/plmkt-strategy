@@ -174,7 +174,7 @@ Estrategia de market making en mercados con rewards de Polymarket. Coloca órden
 | `minRateRetentionPct` | `50` | Si la tasa actual cae por debajo de este % de la tasa de entrada, cierra la posición |
 | `minScoreThreshold` | `0.001` | Score Qmin mínimo para no cerrar por `score_too_low` |
 | `maxPriceMoveThreshold` | `0.15` | Movimiento máximo de precio desde la entrada (15%) antes de cerrar |
-| `maxSpreadCentsThreshold` | `10` | Spread máximo del mercado en centavos para abrir una nueva posición |
+| `minSpreadCentsThreshold` | `3` | Spread mínimo del mercado en centavos para abrir una nueva posición |
 | `minDepthPerSideUsdc` | `800` | Profundidad mínima por lado (USDC) en el order book para abrir |
 | `minDepthLevels` | `5` | Niveles mínimos en el order book para abrir |
 | `maxVolume24hUsdc` | `50000` | Volumen máximo 24h. Mercados más líquidos tienen más competencia en rewards |

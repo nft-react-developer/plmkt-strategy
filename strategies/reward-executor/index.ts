@@ -62,7 +62,7 @@ interface RewardsMarket {
 }
 interface RewardsMarketsResponse { limit: number; count: number; next_cursor: string; data: RewardsMarket[]; }
 interface BookLevel { price: string; size: string; }
-interface ClobBook  { bids: BookLevel[]; asks: BookLevel[]; }
+interface ClobBook  { bids: BookLevel[]; asks: BookLevel[]; last_trade_price?: string; }
 interface BookAnalysis {
   bidDepthUsdc:    number;
   askDepthUsdc:    number;
@@ -80,7 +80,7 @@ interface ExecutorParams {
   minRateRetentionPct:      number;
   minScoreThreshold:        number;
   maxPriceMoveThreshold:    number;
-  maxSpreadCentsThreshold:  number;
+  minSpreadCentsThreshold:  number;
   minDepthPerSideUsdc:      number;
   minDepthLevels:           number;
   maxVolume24hUsdc:         number;
@@ -171,7 +171,7 @@ export const rewardsExecutorStrategy: Strategy = {
     minRateRetentionPct:     50,
     minScoreThreshold:       0.001,
     maxPriceMoveThreshold:   0.15,
-    maxSpreadCentsThreshold: 10,
+    minSpreadCentsThreshold: 3,
     minDepthPerSideUsdc:     800,
     minDepthLevels:          5,
     maxVolume24hUsdc:        50_000,
@@ -556,9 +556,8 @@ export const rewardsExecutorStrategy: Strategy = {
           continue;
         }
 
-        const spreadCents = Number(market.spread ?? 0) * 100;
-        if (spreadCents > p.maxSpreadCentsThreshold) {
-          console.log(`[rewards_executor]   skip ${market.question.slice(0, 60)} — spread ${spreadCents}c > max ${p.maxSpreadCentsThreshold}c`);
+        if (market.spread < p.minSpreadCentsThreshold) {
+          console.log(`[rewards_executor]   skip ${market.question.slice(0, 60)} — spread ${market.spread}c < min ${p.minSpreadCentsThreshold}c`);
           continue;
         }
 
@@ -574,9 +573,10 @@ export const rewardsExecutorStrategy: Strategy = {
         const book = await fetchBook(p.clobApiBase, tokenYes.token_id);
         if (!book) continue;
 
-        const bestBid  = book.bids[0] ? Number(book.bids[0].price) : null;
-        const bestAsk  = book.asks[0] ? Number(book.asks[0].price) : null;
-        const midprice = calcMidprice(bestBid, bestAsk);
+        const bestBid   = book.bids[0] ? Number(book.bids[0].price) : null;
+        const bestAsk   = book.asks[0] ? Number(book.asks[0].price) : null;
+        const lastPrice = book.last_trade_price ? Number(book.last_trade_price) : null;
+        const midprice  = calcMidprice(bestBid, bestAsk);
         if (!midprice) continue;
 
         const bookAnalysis = analyzeBookDepth(book, p.minDepthLevels, p.wallProtectionThreshold);
@@ -593,9 +593,8 @@ export const rewardsExecutorStrategy: Strategy = {
         const liquidityUsdc    = Number(market.volume_24hr ?? 0);
         const sizeUsdc         = calcDynamicSize(p.totalCapitalUsdc, liquidityUsdc);
         const sizePerSide      = sizeUsdc / 2;
-        // Math.floor: la API devuelve 2.5¢ pero Polymarket aplica ±2¢ internamente.
-        // Truncar al entero inferior evita que órdenes en el límite queden sin detectar.
-        const maxSpreadCents   = Math.floor(Number(market.spread ?? 2));
+        
+        const maxSpreadCents   = market.spread;
         const minSizeShares    = Number(market.rewards_min_size   ?? 0);
         const dualSideRequired = midprice < 0.10 || midprice > 0.90;
 
@@ -609,7 +608,9 @@ export const rewardsExecutorStrategy: Strategy = {
           continue;
         }
 
-        const plannedOrders = calcOrderPrices(midprice, maxSpreadCents, effectiveSizePerSide, dualSideRequired, p.placementStrategy);
+        const anchor = lastPrice ?? midprice;
+        console.log(`[rewards_executor]   anchor lastPrice=${lastPrice} midprice=${midprice} → using ${anchor}`);
+        const plannedOrders = calcOrderPrices(anchor, maxSpreadCents, effectiveSizePerSide, dualSideRequired, p.placementStrategy);
 
         const category  = parseCategory(null);
         const feeEntry  = plannedOrders.reduce((s, o) => s + calcTakerFee(o.price, category) * o.sizeUsdc, 0);
@@ -789,7 +790,7 @@ export const rewardsExecutorStrategy: Strategy = {
             `<b>Depth minimo lado:</b> $${bookAnalysis.minDepthUsdc.toFixed(0)}`,
             `<b>Muralla maxima:</b>    $${bookAnalysis.maxWallUsdc.toFixed(0)}`,
             `<b>Max spread:</b> ${maxSpreadCents}c | Placement: ${p.placementStrategy}`,
-            `<b>Spread actual:</b> ${spreadCents.toFixed(1)}c`,
+            `<b>Spread actual:</b> $${market.spread}c`,
             `<b>Midprice:</b> ${(midprice * 100).toFixed(1)}c`,
             `<b>Dual side:</b> ${dualSideRequired ? 'Si' : 'No'}`,
             `<b>Fee entrada:</b> $${feeEntry.toFixed(4)}`,
@@ -980,8 +981,18 @@ async function fetchRewardMarkets(clobBase: string, fetchMinRate: number, fetchM
           rate_per_day: number,
           total_rewards: number,
           total_days: number
-        }[]
+        }
       ,
+    rewards: {
+        rates: [
+            {
+                asset_address: string,
+                rewards_daily_rate: number
+            }
+        ],
+        min_size: number,
+        max_spread: number
+    },
     rewards_max_spread: number,
     rewards_min_size: number,
     end_date_iso?:     string;
@@ -1007,7 +1018,7 @@ async function fetchRewardMarkets(clobBase: string, fetchMinRate: number, fetchM
         condition_id:       d.condition_id,
         question:           d.question ?? '',
         rewards_min_size:   q.rewards_min_size,
-        spread:             Number(d.rewards_max_spread ?? 0),
+        spread:             d.rewards_max_spread ? Number(d.rewards_max_spread ?? 0) : Number(d.rewards.max_spread ?? 0),
         end_date:           endDate,
         tokens:             d.tokens,
         volume_24hr:        0,

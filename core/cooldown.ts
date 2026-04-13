@@ -49,8 +49,14 @@ export class CooldownManager {
     const lastFired = new Date(rows[0].last_fired_at).getTime();
     const ready     = Date.now() - lastFired >= cooldownMs;
 
-    // Actualizar cache si todavía en cooldown
-    if (!ready) this.cache.set(key, lastFired);
+    if (!ready) {
+      // Actualizar cache si todavía en cooldown
+      this.cache.set(key, lastFired);
+    } else {
+      // Marcar en cache como "disparado ahora" para bloquear ticks concurrentes
+      // que pasen por aquí antes de que se llame a stamp()
+      this.cache.set(key, Date.now());
+    }
     return ready;
   }
 
