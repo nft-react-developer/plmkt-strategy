@@ -656,12 +656,20 @@ export const rewardsExecutorStrategy: Strategy = {
             const price   = isSell ? Math.round((1 - o.price) * 100) / 100 : o.price;
             const size    = isSell ? o.sizeUsdc / price : o.sizeShares;
 
-            const posted = await postOrder({
-              tokenId, price, size, side: Side.BUY,
-              negRisk:  market.neg_risk ?? false,
-              tickSize: tickSizeStr,
-              postOnly: true,  // garantiza entrada como maker → cobra rebate, no paga taker fee
-            }).catch(err => { logger.error('[rewards_executor] postOrder failed', err); return null; });
+            let posted: Awaited<ReturnType<typeof postOrder>> | null = null;
+            try {
+              posted = await postOrder({
+                tokenId, price, size, side: Side.BUY,
+                negRisk:  market.neg_risk ?? false,
+                tickSize: tickSizeStr,
+                postOnly: true,  // garantiza entrada como maker → cobra rebate, no paga taker fee
+              });
+            } catch (err) {
+              logger.error('[rewards_executor] postOrder failed', err);
+              await positionQueries.close(positionId, 'manual');
+              positionsClosed++;
+              break;
+            }
 
             if (posted) {
               ordersPostedCount++;
