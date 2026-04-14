@@ -1,7 +1,9 @@
 import express, { Request, Response } from 'express';
 import { fetchRewardMarkets, RewardsMarket } from '../strategies/reward-executor/fetch-reward-markets';
+import { enqueueMarket } from '../strategies/reward-executor/manual-queue';
 
 const app = express();
+app.use(express.json());
 
 const CLOB_BASE   = process.env.CLOB_API_BASE  ?? 'https://clob.polymarket.com';
 const MIN_RATE    = Number(process.env.API_MIN_RATE    ?? 60);
@@ -26,6 +28,17 @@ function broadcast(markets: RewardsMarket[]) {
   const payload = `data: ${JSON.stringify({ ts: Date.now(), count: markets.length, markets })}\n\n`;
   for (const res of clients) res.write(payload);
 }
+
+// ── POST /positions/enter — entrada manual ────────────────────────────────────
+
+app.post('/positions/enter', async (req: Request, res: Response) => {
+  const { condition_id } = req.body ?? {};
+  if (!condition_id || typeof condition_id !== 'string') {
+    return res.status(400).json({ error: 'condition_id requerido' });
+  }
+  await enqueueMarket(condition_id);
+  res.json({ queued: true, condition_id });
+});
 
 // ── REST endpoint (snapshot) ──────────────────────────────────────────────────
 

@@ -129,3 +129,91 @@ export async function fetchRewardMarkets(clobBase: string, fetchMinRate: number,
   console.log(`[rewards_executor] fetchRewardMarkets: ${markets.length} mercados listos`);
   return markets;
 }
+
+export async function fetchSingleMarket(
+  clobBase: string,
+  conditionId: string,
+): Promise<RewardsMarket | null> {
+  interface ClobMarketDetail {
+    condition_id:      string;
+    question:          string;
+    tokens:            RewardToken[];
+    neg_risk:          boolean;
+    minimum_tick_size: number;
+    rewards_config: {
+      asset_address: string;
+      start_date: string;
+      end_date: string;
+      id: number;
+      rate_per_day: number;
+      total_rewards: number;
+      total_days: number;
+    };
+    rewards: {
+      rates: [{ asset_address: string; rewards_daily_rate: number }];
+      min_size: number;
+      max_spread: number;
+    };
+    rewards_max_spread: number;
+    rewards_min_size: number;
+    end_date_iso?:     string;
+    end_date?:         string;
+  }
+  interface CurrentEntry {
+    condition_id:        string;
+    rewards_min_size:    number;
+    rewards_max_spread:  number;
+    total_daily_rate?:   number;
+    rewards_config?:     Array<{ rate_per_day?: number; end_date?: string; id?: number; [k: string]: unknown }>;
+  }
+  interface CurrentResponse { limit: number; count: number; next_cursor: string; data: CurrentEntry[]; }
+
+  try {
+    const detailRes = await fetch(`${clobBase}/markets/${conditionId}`, { signal: AbortSignal.timeout(10_000) });
+    if (!detailRes.ok) return null;
+    const d = await detailRes.json() as ClobMarketDetail;
+
+    if (!d.tokens || d.tokens.length < 2) return null;
+    if (d.tokens.some((t: RewardToken & { winner?: boolean }) => t.winner === true)) return null;
+    if (d.tokens.some((t: RewardToken) => Number(t.price) === 0 || Number(t.price) === 1)) return null;
+
+    // Buscar rewards config activa
+    let ratePerDay = 0;
+    let rewardEndDate = '';
+    let rewardId = 0;
+    let rewardsMinSize = 0;
+    let rewardsMaxSpread = 0;
+
+    try {
+      const rewardsRes = await fetch(`${clobBase}/rewards/markets/current?sponsored=true`, { signal: AbortSignal.timeout(10_000) });
+      if (rewardsRes.ok) {
+        const rewardsData = await rewardsRes.json() as CurrentResponse;
+        const entry = rewardsData.data?.find((m: CurrentEntry) => m.condition_id === conditionId);
+        if (entry) {
+          ratePerDay = Number(entry.total_daily_rate ?? entry.rewards_config?.[0]?.rate_per_day ?? 0);
+          rewardEndDate = String(entry.rewards_config?.[0]?.end_date ?? '');
+          rewardId = Number(entry.rewards_config?.[0]?.id ?? 0);
+          rewardsMinSize = Number(entry.rewards_min_size ?? 0);
+          rewardsMaxSpread = Number(entry.rewards_max_spread ?? 0);
+        }
+      }
+    } catch { /* rewards no críticos */ }
+
+    const endDate = d.end_date_iso ?? d.end_date ?? '';
+
+    return {
+      condition_id:      d.condition_id,
+      question:          d.question ?? '',
+      rewards_min_size:  rewardsMinSize || (d.rewards_min_size ? Number(d.rewards_min_size) : 0),
+      spread:            rewardsMaxSpread || (d.rewards_max_spread ? Number(d.rewards_max_spread) : Number(d.rewards?.max_spread ?? 0)),
+      end_date:          endDate,
+      tokens:            d.tokens,
+      volume_24hr:       0,
+      rewards_config:    [{ id: rewardId, asset_address: '', start_date: '', end_date: rewardEndDate || endDate, rate_per_day: ratePerDay, total_rewards: 0 }],
+      neg_risk:          d.neg_risk ?? false,
+      minimum_tick_size: d.minimum_tick_size ?? 0.01,
+    };
+  } catch {
+    return null;
+  }
+}

@@ -34,7 +34,8 @@ import { syncInventory, closeInventoryPosition, getInventoryState, rebalanceWith
 import { repriceIfNeeded, requeueIfNeeded, clearRepriceTracker, clearRequeueTracker } from '../../core/order-replacer';
 import { postOrder, cancelAllForMarket, verifyAuth, getOpenOrders, fetchUserEarningsForMarkets } from '../../core/clob-client';
 import { Side } from '@polymarket/clob-client';
-import { fetchRewardMarkets, RewardsMarket } from './fetch-reward-markets';
+import { fetchRewardMarkets, fetchSingleMarket, RewardsMarket } from './fetch-reward-markets';
+import { drainQueue, dequeueMarket } from './manual-queue';
 
 // ---- Tipos ------------------------------------------------------------------
 
@@ -74,6 +75,7 @@ interface ExecutorParams {
   fetchMinRatePerDay:           number;
   fetchMaxMinSize:              number;
   earningsCheckDelayMinutes:    number;
+  manualEntryOnly:              boolean;
 }
 
 // ---- Keywords baneados por defecto ------------------------------------------
@@ -165,6 +167,7 @@ export const rewardsExecutorStrategy: Strategy = {
     fetchMinRatePerDay:          200,
     fetchMaxMinSize:             50,
     earningsCheckDelayMinutes:   5,
+    manualEntryOnly:             false,
   } satisfies ExecutorParams,
 
   async run(params): Promise<StrategyRunResult> {
@@ -510,6 +513,25 @@ export const rewardsExecutorStrategy: Strategy = {
     console.log(`[rewards_executor] slots disponibles: ${slotsAvailable}/${p.maxPositions}`);
 
     if (slotsAvailable > 0) {
+      // ---- 2a. Entradas manuales (queue de endpoint) -----------------------
+      const pendingIds = await drainQueue();
+      console.log(`[rewards_executor] entradas manuales pendientes: ${pendingIds.length}`);
+      for (const conditionId of pendingIds) {
+        if (positionsOpened >= slotsAvailable) break;
+        const market = await fetchSingleMarket(p.clobApiBase, conditionId);
+        if (!market) { logger.warn(`[manual] no se encontró ${conditionId}, dejando en queue`); continue; }
+        if (await positionQueries.hasOpen(conditionId, p.paperTrading)) {
+          logger.info(`[manual] ya existe posición abierta para ${conditionId}`);
+          await dequeueMarket(conditionId);
+          continue;
+        }
+        const prevOpened = positionsOpened;
+        await openPositionForMarket(market, p, signals, () => { positionsOpened++; });
+        if (positionsOpened > prevOpened) await dequeueMarket(conditionId);
+      }
+
+      // ---- 2b. Auto-discovery (salta si manualEntryOnly=true) -------------
+      if (!p.manualEntryOnly) {
       const markets = await fetchRewardMarkets(p.clobApiBase, p.fetchMinRatePerDay, p.fetchMaxMinSize).catch(err => {
         logger.error('[rewards_executor] fetchRewardMarkets failed', err);
         return [];
@@ -820,6 +842,7 @@ export const rewardsExecutorStrategy: Strategy = {
           },
         });
       }
+      } // end if (!p.manualEntryOnly)
     }
 
     console.log(
@@ -866,6 +889,204 @@ async function closeRealPosition(positionId: number, tokenIdYes: string, midpric
   } catch (err) {
     logger.error(`[rewards_executor] Error cerrando posicion real #${positionId}`, err);
   }
+}
+
+async function openPositionForMarket(
+  market: RewardsMarket,
+  p: ExecutorParams,
+  signals: StrategyRunResult['signals'],
+  onOpened: () => void,
+): Promise<void> {
+  const config     = market.rewards_config[0] ?? { id: 0, rate_per_day: 0, end_date: market.end_date, asset_address: '', start_date: '', total_rewards: 0 };
+  const ratePerDay = Number(config.rate_per_day ?? 0);
+
+  const tokenYes = market.tokens.find(t => t.outcome === 'YES') ?? market.tokens[0];
+  const tokenNo  = market.tokens.find(t => t.outcome === 'NO')  ?? market.tokens[1];
+  if (!tokenYes) return;
+
+  const [book, lastTradePrice] = await Promise.all([
+    fetchBook(p.clobApiBase, tokenYes.token_id),
+    fetchLastTradePrice(p.clobApiBase, tokenYes.token_id),
+  ]);
+  if (!book) return;
+
+  const bestBid   = book.bids[0] ? Number(book.bids[0].price) : null;
+  const bestAsk   = book.asks[0] ? Number(book.asks[0].price) : null;
+  const lastPrice = lastTradePrice;
+  const midprice  = calcMidprice(bestBid, bestAsk);
+  if (!midprice) return;
+
+  const liquidityUsdc    = Number(market.volume_24hr ?? 0);
+  const sizeUsdc         = calcDynamicSize(p.totalCapitalUsdc, liquidityUsdc);
+  const sizePerSide      = sizeUsdc / 2;
+
+  const maxSpreadCents   = market.spread;
+  const minSizeShares    = Number(market.rewards_min_size ?? 0);
+  const dualSideRequired = midprice < 0.10 || midprice > 0.90;
+
+  const minSizeUsdc = minSizeShares > 0 ? minSizeShares * Math.max(midprice, 1 - midprice) : 0;
+  const effectiveSizePerSide = minSizeUsdc > sizePerSide ? minSizeUsdc : sizePerSide;
+
+  if (minSizeShares > 0 && effectiveSizePerSide > p.totalCapitalUsdc / 2) {
+    logger.warn(`[manual] skip ${market.question.slice(0, 60)} — minShares ${minSizeShares} requiere $${minSizeUsdc.toFixed(0)}/lado > capital`);
+    return;
+  }
+
+  const anchor = lastPrice ?? midprice;
+  const plannedOrders = calcOrderPrices(anchor, maxSpreadCents, effectiveSizePerSide, dualSideRequired, p.placementStrategy);
+
+  const category  = parseCategory(null);
+  const feeEntry  = plannedOrders.reduce((s, o) => s + calcTakerFee(o.price, category) * o.sizeUsdc, 0);
+  const entrySpreadCents = bestBid && bestAsk ? (bestAsk - bestBid) * 100 : null;
+
+  const totalDepth     = (book.bids.reduce((s, l) => s + Number(l.size) * Number(l.price), 0)) +
+                         (book.asks.reduce((s, l) => s + Number(l.size) * Number(l.price), 0));
+  const estimatedShare = totalDepth > 0 ? (sizeUsdc / totalDepth) * 100 : 0;
+
+  const positionId = await positionQueries.open({
+    paperTrading: p.paperTrading, marketId: market.condition_id,
+    marketQuestion: market.question, marketSlug: market.market_slug ?? market.slug ?? undefined,
+    eventSlug: market.event_slug ?? undefined, tokenIdYes: tokenYes.token_id,
+    tokenIdNo: tokenNo?.token_id, rewardId: String(config.id),
+    dailyRewardUsdc: ratePerDay, maxSpreadCents, minSizeShares,
+    rewardEndDate: new Date(config.end_date), scalingFactorC: 3.0,
+    sizeUsdc, sizePerSideUsdc: sizePerSide,
+    entryMidprice: midprice, entryBid: bestBid ?? undefined,
+    entryAsk: bestAsk ?? undefined, entrySpreadCents: entrySpreadCents ?? undefined,
+    dualSideRequired, totalLiquidityUsdc: liquidityUsdc,
+  });
+
+  await orderQueries.insertMany(
+    plannedOrders.map(o => ({
+      positionId, paperTrading: p.paperTrading, tokenId: tokenYes.token_id,
+      side: o.side, price: o.price, sizeUsdc: o.sizeUsdc,
+      sizeShares: o.sizeShares, spreadFromMidCents: o.spreadFromMidCents,
+    })),
+  );
+
+  if (!p.paperTrading) {
+    const tickSizeStr = String(market.minimum_tick_size ?? 0.01) as '0.1' | '0.01' | '0.001' | '0.0001';
+    let immediatelyFilled = false;
+    let ordersPostedCount = 0;
+    const filledOrders: { tokenId: string; price: number; size: number }[] = [];
+
+    for (const o of plannedOrders) {
+      const isSell  = o.side === 'sell';
+      const tokenId = isSell ? tokenNo.token_id  : tokenYes.token_id;
+      const price   = isSell ? Math.round((1 - o.price) * 100) / 100 : o.price;
+      const rawSize = isSell ? o.sizeUsdc / price : o.sizeShares;
+      const size    = minSizeShares > 0 ? Math.max(rawSize, minSizeShares) : rawSize;
+
+      let posted: Awaited<ReturnType<typeof postOrder>> | null = null;
+      try {
+        posted = await postOrder({
+          tokenId, price, size, side: Side.BUY,
+          negRisk:  market.neg_risk ?? false,
+          tickSize: tickSizeStr,
+          postOnly: true,
+        });
+      } catch (err) {
+        logger.error('[rewards_executor] postOrder failed', err);
+        await positionQueries.close(positionId, 'manual');
+        return;
+      }
+
+      if (posted) {
+        ordersPostedCount++;
+        const label = isSell
+          ? `BUY NO @ ${price.toFixed(2)} (≡ SELL YES @ ${o.price.toFixed(2)})`
+          : `BUY YES @ ${price.toFixed(2)}`;
+        const marketLink = market.event_slug
+          ? `https://polymarket.com/event/${market.event_slug}`
+          : market.market_slug ? `https://polymarket.com/market/${market.market_slug}` : null;
+        logger.info(
+          `[rewards_executor] Orden colocada | id: ${posted.orderId} | status: ${posted.status} | ${label}` +
+          ` | "${market.question.slice(0, 50)}"` +
+          (marketLink ? ` | ${marketLink}` : ''),
+        );
+
+        await orderQueries.insertMany([{
+          positionId, paperTrading: false, tokenId, side: 'buy', price,
+          sizeUsdc: o.sizeUsdc, sizeShares: size, spreadFromMidCents: o.spreadFromMidCents,
+          clobOrderId: posted.orderId, status: posted.status === 'matched' ? 'filled' : 'open',
+        }]);
+
+        if (posted.status === 'matched') {
+          const mLink = market.event_slug
+            ? `https://polymarket.com/event/${market.event_slug}`
+            : market.market_slug ? `https://polymarket.com/market/${market.market_slug}` : null;
+          logger.warn(
+            `[rewards_executor] ⚠️ Orden fillada inmediatamente (status: matched)` +
+            ` — colocando LIMIT SELL break-even @ ${price.toFixed(4)}` +
+            ` | "${market.question.slice(0, 50)}"` +
+            (mLink ? ` | ${mLink}` : ''),
+          );
+          immediatelyFilled = true;
+          filledOrders.push({ tokenId, price, size });
+          break;
+        }
+      }
+    }
+
+    if (ordersPostedCount === 0) {
+      logger.error(`[rewards_executor] #${positionId} — ninguna orden colocada, cerrando posicion`);
+      await positionQueries.close(positionId, 'manual');
+      return;
+    }
+
+    if (immediatelyFilled) {
+      await cancelAllForMarket(tokenYes.token_id).catch(err =>
+        logger.error(`[rewards_executor] Error cancelando ordenes tras fill inmediato`, err),
+      );
+      if (tokenNo?.token_id) await cancelAllForMarket(tokenNo.token_id).catch(() => {});
+
+      for (const filled of filledOrders) {
+        const breakEvenResult = await postOrder({
+          tokenId: filled.tokenId, price: filled.price, size: filled.size,
+          side: Side.SELL, negRisk: market.neg_risk ?? false, tickSize: tickSizeStr,
+        }).catch(err => { logger.error('[rewards_executor] Error colocando break-even sell', err); return null; });
+
+        if (breakEvenResult) {
+          const mLink = market.event_slug
+            ? `https://polymarket.com/event/${market.event_slug}`
+            : market.market_slug ? `https://polymarket.com/market/${market.market_slug}` : null;
+          logger.info(
+            `[rewards_executor] Break-even SELL colocado | id: ${breakEvenResult.orderId} | ` +
+            `SELL ${filled.size.toFixed(2)} @ ${filled.price.toFixed(4)} (maker rebate) | ` +
+            `"${market.question.slice(0, 50)}"` +
+            (mLink ? ` | ${mLink}` : ''),
+          );
+        }
+      }
+
+      console.log(
+        `[rewards_executor]   #${positionId} — fill inmediato | ` +
+        `break-even SELL @ ${filledOrders.map(f => f.price.toFixed(4)).join(', ')} | posicion sigue abierta`,
+      );
+    }
+  }
+
+  await positionQueries.addFee(positionId, feeEntry);
+  const cooldownKey = `${market.condition_id}:${p.paperTrading}`;
+  await cooldown.stamp(cooldownKey);
+  onOpened();
+
+  signals.push({
+    strategyId: 'rewards_executor',
+    severity:   'low',
+    title:      `${p.paperTrading ? 'PAPER' : 'REAL'} Nueva posicion: ${market.question.slice(0, 50)}`,
+    body: [
+      `<b>Mercado:</b> ${market.question}`,
+      `<b>Rate rewards:</b> $${ratePerDay}/dia`,
+      `<b>Capital:</b> $${sizeUsdc.toFixed(0)} USDC (share estimado: ${estimatedShare.toFixed(1)}%)`,
+      `<b>Modo:</b> ${p.paperTrading ? 'Paper' : 'Real'}`,
+    ].join('\n'),
+    metadata: {
+      positionId, marketId: market.condition_id, rewardId: config.id,
+      ratePerDay, maxSpread: maxSpreadCents, midprice, sizeUsdc,
+      estimatedSharePct: estimatedShare, paperTrading: p.paperTrading,
+    },
+  });
 }
 
 function buildCloseSignal(

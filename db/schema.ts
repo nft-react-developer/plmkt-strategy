@@ -305,3 +305,11 @@ export const dailyPnl = mysqlTable('daily_pnl', {
   idxDate:      index('idx_dpnl_date').on(t.date),
   idxPaper:     index('idx_dpnl_paper').on(t.paperTrading),
 }));
+
+export const manualEntryQueue = mysqlTable('manual_entry_queue', {
+  id:          int('id').primaryKey().autoincrement(),
+  conditionId: varchar('condition_id', { length: 128 }).notNull().unique(),
+  createdAt:   timestamp('created_at').defaultNow(),
+}, t => ({
+  idxCreated: index('idx_meq_created').on(t.createdAt),
+}));
