@@ -5,6 +5,7 @@ import { testConnection, closeDb, getDb } from './db/connection';
 import { telegram } from './telegram/notifier';
 import { logger } from './utils/logger';
 import { startCommandListener } from './telegram/commands';
+import { startApiServer } from './api/server';
 
 async function main() {
   logger.info('🔄 Connecting to database...');
@@ -18,6 +19,7 @@ async function main() {
 
   await startRunner();
   startCommandListener();
+  startApiServer();
 
   const active = getActiveStrategies();
   await telegram.sendStartup(active);
