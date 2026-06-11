@@ -26,7 +26,7 @@
 import { getOpenOrders, getMyTrades, cancelOrder, postOrder } from './clob-client';
 import { orderQueries, positionQueries }                       from '../db/queries-paper';
 import { logger }                                             from '../utils/logger';
-import { Side } from '@polymarket/clob-client';
+import { Side } from '@polymarket/clob-client-v2';
 
 // ─── Tipos ───────────────────────────────────────────────────────────────────
 

@@ -16,11 +16,10 @@
 
 import * as dotenv from 'dotenv';
 dotenv.config();
-import { ApiKeyCreds, ClobClient } from '@polymarket/clob-client';
+import { ApiKeyCreds, Chain, ClobClient } from '@polymarket/clob-client-v2';
 import { Wallet }    from '@ethersproject/wallet';
 
-const CLOB_BASE        = 'https://clob.polymarket.com';
-const POLYGON_CHAIN_ID = 137;
+const CLOB_BASE = 'https://clob.polymarket.com';
 const FUNDER       = process.env.POLY_FUNDER!; // Opcional: dirección de tu wallet (puede derivarse de la private key, pero la ponemos explícita para evitar confusiones)
 const SIGNATURE_TYPE       = Number(process.env.POLY_SIGNATURE_TYPE ?? 1);
 
@@ -44,7 +43,7 @@ async function main() {
   }
 
   // Paso 1: cliente temporal sin creds para derivar las API keys
-  const tempClient = new ClobClient(CLOB_BASE, POLYGON_CHAIN_ID, signer as any);
+  const tempClient = new ClobClient({ host: CLOB_BASE, chain: Chain.POLYGON, signer: signer as any });
 
   console.log('[generate-api-keys] Derivando credenciales (firma EIP-712)...');
 
@@ -76,14 +75,14 @@ async function main() {
   // Nota: las credenciales pueden tardar hasta 2 minutos en activarse
   console.log('[generate-api-keys] Verificando credenciales (puede tardar hasta 2 min)...');
 
-  const client = new ClobClient(
-    CLOB_BASE,
-    POLYGON_CHAIN_ID,
-    signer as any,
-    { key: creds.key, secret: creds.secret, passphrase: creds.passphrase },
-    SIGNATURE_TYPE,
-    FUNDER,
-  );
+  const client = new ClobClient({
+    host: CLOB_BASE,
+    chain: Chain.POLYGON,
+    signer: signer as any,
+    creds: { key: creds.key, secret: creds.secret, passphrase: creds.passphrase },
+    signatureType: SIGNATURE_TYPE,
+    funderAddress: FUNDER,
+  });
 
   // Reintentar hasta 6 veces con 20s de espera
   for (let i = 1; i <= 6; i++) {

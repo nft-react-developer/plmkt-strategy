@@ -1,5 +1,5 @@
 import 'dotenv/config';
-import { ClobClient } from '@polymarket/clob-client';
+import { Chain, ClobClient } from '@polymarket/clob-client-v2';
 import { Wallet } from '@ethersproject/wallet';
 
 async function main() {
@@ -15,14 +15,14 @@ async function main() {
   console.log('sigType: ', sigType);
   console.log('apiKey:  ', apiKey?.slice(0, 8) + '...');
 
-  const client = new ClobClient(
-    'https://clob.polymarket.com',
-    137,
-    wallet as any,
-    { key: apiKey, secret, passphrase },
-    sigType,
-    funder,
-  );
+  const client = new ClobClient({
+    host: 'https://clob.polymarket.com',
+    chain: Chain.POLYGON,
+    signer: wallet as any,
+    creds: { key: apiKey, secret, passphrase },
+    signatureType: sigType,
+    funderAddress: funder,
+  });
 
   try {
     const orders = await client.getOpenOrders();

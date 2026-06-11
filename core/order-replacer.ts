@@ -22,7 +22,7 @@ import { calcMidprice, calcOrderPrices }              from './rewards-scoring';
 import { orderQueries, positionQueries }              from '../db/queries-paper';
 import { calcTakerFee, parseCategory }               from '../utils/fees';
 import { logger }                                    from '../utils/logger';
-import { Side } from '@polymarket/clob-client';
+import { Side } from '@polymarket/clob-client-v2';
 
 // ─── Tipos ───────────────────────────────────────────────────────────────────
 

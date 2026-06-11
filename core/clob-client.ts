@@ -13,12 +13,11 @@
 //   POLY_SIGNATURE_TYPE  — 2 (GNOSIS_SAFE)
 import * as dotenv from 'dotenv';
 dotenv.config();
-import { ClobClient, Side } from '@polymarket/clob-client';
+import { ClobClient, Chain, Side } from '@polymarket/clob-client-v2';
 import { Wallet } from '@ethersproject/wallet';
 import { logger }            from '../utils/logger';
 
-const CLOB_BASE        = process.env.CLOB_API_BASE ?? 'https://clob.polymarket.com';
-const POLYGON_CHAIN_ID = 137;
+const CLOB_BASE = process.env.CLOB_API_BASE ?? 'https://clob.polymarket.com';
 
 // ─── Singleton ────────────────────────────────────────────────────────────────
 
@@ -47,14 +46,14 @@ console.log('POLY_SIGNATURE_TYPE:', process.env.POLY_SIGNATURE_TYPE);
   const wallet = new Wallet(privateKey);
   logger.info(`[clob-client] Inicializando — wallet: ${wallet.address} | funder: ${funder} | sigType: ${sigType}`);
 
-  _client = new ClobClient(
-    CLOB_BASE,
-    POLYGON_CHAIN_ID,
-    wallet as any,
-    { key: apiKey, secret, passphrase },
-    sigType,
-    funder,
-  );
+  _client = new ClobClient({
+    host: CLOB_BASE,
+    chain: Chain.POLYGON,
+    signer: wallet as any,
+    creds: { key: apiKey, secret, passphrase },
+    signatureType: sigType,
+    funderAddress: funder,
+  });
 
   return _client;
 }
@@ -171,7 +170,8 @@ export async function fetchUserEarningsForMarkets(): Promise<
 > {
   try {
     const client  = getClobClient();
-    const results = await (client as any).getUserEarningsAndMarketsConfig();
+    const today = new Date().toISOString().slice(0, 10);
+    const results = await (client as any).getUserEarningsAndMarketsConfig(today);
     if (!Array.isArray(results)) return null;
     return results as Array<{ condition_id: string; earning_percentage: number }>;
   } catch (err) {

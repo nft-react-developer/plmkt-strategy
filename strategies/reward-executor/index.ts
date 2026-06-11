@@ -33,7 +33,7 @@ import { logger }                                                               
 import { syncInventory, closeInventoryPosition, getInventoryState, rebalanceWithBreakEvenHedge, clearBreakEvenHedge } from '../../core/inventory-manager';
 import { repriceIfNeeded, requeueIfNeeded, clearRepriceTracker, clearRequeueTracker } from '../../core/order-replacer';
 import { postOrder, cancelAllForMarket, verifyAuth, getOpenOrders, fetchUserEarningsForMarkets } from '../../core/clob-client';
-import { Side } from '@polymarket/clob-client';
+import { Side } from '@polymarket/clob-client-v2';
 import { fetchRewardMarkets, fetchSingleMarket, RewardsMarket } from './fetch-reward-markets';
 import { drainQueue, dequeueMarket } from './manual-queue';
 
@@ -834,6 +834,8 @@ export const rewardsExecutorStrategy: Strategy = {
             `<b>Dual side:</b> ${dualSideRequired ? 'Si' : 'No'}`,
             `<b>Fee entrada:</b> $${feeEntry.toFixed(4)}`,
             `<b>Modo:</b> ${p.paperTrading ? 'Paper' : 'Real'}`,
+            p.manualEntryOnly ? `<b>Entrada manual:</b> Sí ` : `<b>Entrada manual:</b> No`
+
           ].join('\n'),
           metadata: {
             positionId, marketId: market.condition_id, rewardId: config.id,
@@ -865,6 +867,7 @@ export const rewardsExecutorStrategy: Strategy = {
     const p = params as unknown as ExecutorParams;
     logger.info(
       `[rewards_executor] init | modo: ${p.paperTrading ? 'PAPER' : 'REAL'}` +
+      ` | manual: ${p.manualEntryOnly ? 'Sí' : 'No'}` +
       ` | capital: $${p.totalCapitalUsdc} | maxPos: ${p.maxPositions}` +
       ` | minDepth: $${p.minDepthPerSideUsdc} | wall: $${p.wallProtectionThreshold}`,
     );
