@@ -1,6 +1,11 @@
 # TODO: Reprecio manual de órdenes vía Telegram
 
-## Estado: SIN IMPLEMENTAR
+## Estado: SIN IMPLEMENTAR (revisado 2026-10)
+
+> Sigue pendiente. Los comandos Telegram actuales son `/current_rewards`,
+> `/positions`, `/status`, `/pause`, `/resume`, `/help` — no existe `/reprice`.
+> Contexto operativo actual en `openspec/specs/operator-interfaces/spec.md` y
+> la lógica de reprice existente en `openspec/specs/order-replacement/spec.md`.
 
 ## Objetivo
 

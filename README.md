@@ -4,28 +4,50 @@ Monitor de mercados de predicción con múltiples estrategias configurables.
 
 ## Estructura
 
-```
+```text
 .
-├── index.ts                        ← Entry point
+├── index.ts                        ← Entry point (runner + Telegram + API)
+├── api/
+│   ├── index.ts                    ← Entry standalone del servidor API
+│   └── server.ts                   ← REST reward-markets, SSE viewer, POST /positions/enter
 ├── core/
 │   ├── strategy.interface.ts       ← Contrato que toda estrategia implementa
-│   └── runner.ts                   ← Orquesta estrategias: schedule, enable/disable, daily report
+│   ├── runner.ts                   ← Orquesta estrategias: schedule, enable/disable, daily report
+│   ├── clob-client.ts              ← Gateway autenticado del CLOB (órdenes reales)
+│   ├── inventory-manager.ts        ← Sync de inventario real, fills, break-even hedge
+│   ├── order-replacer.ts           ← Reprice y requeue FIFO
+│   ├── rewards-scoring.ts          ← Fórmula Qmin de rewards de Polymarket
+│   ├── cooldown.ts                 ← Cooldowns DB-backed de signals
+│   ├── resolve-outcomes.ts         ← Resolución nocturna de outcomes (03:00 UTC)
+│   └── rewards-daily-report.ts     ← Reporte diario de rewards (implementado, sin scheduler)
 ├── strategies/
 │   ├── registry.ts                 ← Lista de estrategias registradas
-│   ├── whale-tracker/index.ts      ← S1: Wallets con alto win-rate
-│   ├── smart-money/index.ts        ← S2: Confluencia de wallets inteligentes
-│   ├── odds-mover/index.ts         ← S3: Movimientos bruscos de precio
-│   └── order-book/index.ts         ← S4: Imbalance en CLOB
+│   ├── reward-executor/            ← Estrategia activa: market making en reward markets
+│   ├── whale-tracker/              ← S1 (deshabilitada en registry)
+│   ├── smart-money/                ← S2 (deshabilitada en registry)
+│   ├── odds-mover/                 ← S3 (deshabilitada en registry)
+│   ├── order-book/                 ← S4 (deshabilitada en registry)
+│   └── resolution-arb/             ← S5 (deshabilitada en registry)
 ├── db/
 │   ├── connection.ts               ← Pool de MariaDB + Drizzle
-│   ├── schema.ts                   ← Definición de tablas (Drizzle)
-│   ├── queries.ts                  ← Todas las queries tipadas
-│   └── migrations.sql              ← DDL para ejecutar en la DB
+│   ├── schema.ts                   ← Definición de tablas (Drizzle, fuente de verdad)
+│   ├── queries.ts                  ← Queries de estrategias/wallets/monitoreo
+│   ├── queries-paper.ts            ← Queries de market making (positions/orders/accruals)
+│   ├── migration.sql               ← DDL stage 1 (faltan tablas de market making)
+│   └── update-position.sql         ← Cierre manual de emergencia (posiciones reales)
 ├── telegram/
-│   └── notifier.ts                 ← Envío de mensajes a Telegram
+│   ├── notifier.ts                 ← Envío de mensajes a Telegram (send-only)
+│   └── commands.ts                 ← Comandos operativos (/pause, /positions, ...)
+├── scripts/                        ← CLI operativo y scripts de mantenimiento
 └── utils/
-    └── logger.ts
+    ├── logger.ts
+    ├── fees.ts                     ← Modelo de taker fees 2026
+    └── polymarket.ts               ← Clientes Gamma/helpers
 ```
+
+> **Estado actual del registry**: solo `rewards_executor` está activa. Las cinco
+> estrategías de monitoreo están implementadas pero comentadas en
+> `strategies/registry.ts`. Ver `openspec/` para las specs de capacidades al día.
 
 ## Agregar una nueva estrategia
 
@@ -221,4 +243,20 @@ TELEGRAM_BOT_TOKEN=123456:ABC...
 TELEGRAM_CHAT_ID=-100123456789
 
 LOG_LEVEL=info   # debug | info | warn | error
+
+# API (opcional; default 3001)
+API_PORT=3001
+
+# CLOB — solo necesarias para real trading (paper no las usa)
+# Generar con: yarn generate-api-key
+PRIVATE_KEY=0x...
+POLY_API_KEY=...
+POLY_API_SECRET=...
+POLY_API_PASSPHRASE=...
+POLY_FUNDER=0x...          # address del funder (proxy/Gnosis Safe)
+POLY_SIGNATURE_TYPE=2     # 1=EOA, 2=Gnosis Safe (default del cliente)
 ```
+
+> ⚠️ `POLY_SIGNATURE_TYPE` debe coincidir con el tipo de la wallet real. El
+> script `generate-api-keys.ts` defaultea a 1 (EOA) mientras el cliente
+> defaultea a 2 — verificar antes de operar en real.

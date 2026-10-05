@@ -1,6 +1,11 @@
 # TODO: Endpoint para entrada manual de mercado
 
-## Estado: SIN IMPLEMENTAR
+## Estado: IMPLEMENTADO (revisado 2026-10)
+
+> La funcionalidad está completa en código y activa. Este documento se conserva
+> como registro de diseño. La descripción de abajo refleja el diseño original;
+> las divergencias con la implementación final están en **Notas de
+> reconciliación**.
 
 ## Objetivo
 
@@ -176,9 +181,22 @@ WHERE strategy_id = 'rewards_executor';
 
 ---
 
-## Notas
+## Notas de reconciliación (implementación final)
+
+- La queue es **DB-backed** (`manual_entry_queue`, ver `db/schema.ts`), no el
+  singleton en memoria propuesto acá: las entradas sobreviven reinicios del
+  proceso.
+- `fetchSingleMarket` existe en `strategies/reward-executor/fetch-reward-markets.ts`
+  y devuelve el mercado aunque no tenga rewards activos (`rate_per_day: 0`).
+- `manualEntryOnly` está en `ExecutorParams` y `defaultParams`, y la apertura
+  manual extraída en `openPositionForMarket` (`strategies/reward-executor/index.ts`).
+- El endpoint `POST /positions/enter` vive en `api/server.ts` y encola en DB.
+- Comportamiento especificado al día en `openspec/specs/rewards-executor/spec.md`
+  y `openspec/specs/operator-interfaces/spec.md`.
+
+## Notas originales
 
 - La respuesta del endpoint es **inmediata** — el bot lo procesa en el siguiente tick (máx 60s de delay)
 - Las entradas manuales **saltan todos los filtros** (rate, spread, depth, keywords, cooldown) porque el usuario ya tomó la decisión
 - El parámetro `manualEntryOnly` se puede cambiar en DB sin reiniciar el bot (se lee en cada tick)
-- Si el bot no está corriendo, la queue se pierde (vive en memoria) — el endpoint requiere bot activo
+- ~~Si el bot no está corriendo, la queue se pierde (vive en memoria)~~ → la queue vive en DB y sobrevive reinicios; si el bot no corre, se procesa al reanudar

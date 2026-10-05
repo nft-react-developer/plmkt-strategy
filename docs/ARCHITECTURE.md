@@ -7,7 +7,7 @@ The system is a Node.js/TypeScript trading bot with a strategy runner, MySQL per
 1. `index.ts` boots the DB, runner, Telegram command listener, and API server.
 2. `core/runner.ts` registers strategies in DB, merges DB params over defaults, and runs enabled strategies sequentially.
 3. `strategies/registry.ts` controls which strategies are active in code. Currently only `rewards_executor` is registered.
-4. `db/schema.ts` is the source of truth for tables; `db/queries.ts` and `db/queries-paper.ts` wrap persistence.
+4. `db/schema.ts` is the source of truth for tables; `db/queries.ts` and `db/queries-paper.ts` wrap persistence. `db/migration.sql` only covers the stage-1 tables (strategy runtime, wallets, market monitoring); the market-making tables exist in the schema but their DDL was applied out-of-band.
 5. `core/clob-client.ts` is the authenticated gateway for real CLOB orders.
 
 ## Runtime topology
@@ -18,6 +18,7 @@ index.ts
   ├─ core/runner.ts                strategy lifecycle and schedules
   │   ├─ strategies/registry.ts    registered strategy list
   │   ├─ db/queries.ts             strategy config, runs, signals, wallet/order-book data
+  │   ├─ core/resolve-outcomes.ts  nightly signal outcome resolution (03:00 UTC)
   │   └─ telegram/notifier.ts      startup, report, signal messages
   ├─ telegram/commands.ts          Telegram operational commands
   └─ api/server.ts                 reward market API, SSE viewer, manual entry endpoint
@@ -102,13 +103,33 @@ Important collaborators:
 | `paperTrading` default | `rewards_executor.defaultParams` | Keeps default behavior simulated. |
 | `postOnly` LP orders | `core/clob-client.ts`, reward executor | Avoids crossing the spread as taker for liquidity-providing orders. |
 | Break-even hedge | `core/inventory-manager.ts` | Covers filled BUY exposure with a limit SELL at entry price. |
-| Earnings health check | `fetchUserEarningsForMarkets()` | Detects orders not earning rewards and can force requeue. |
+| Earnings health check | `fetchUserEarningsForMarkets()` | Detects orders not earning rewards. In **real** mode an out-of-range/wall-break closes the position (`close_reason='manual'`); the requeue path is commented out. In **paper** mode it still requeues FIFO. |
 | DB-backed manual queue | `manual_entry_queue` | Manual entries survive process restarts better than in-memory queues. |
+
+## Disabled / dead code (implemented but not active)
+
+| Component | State |
+|---|---|
+| Signal delivery to Telegram | Commented out in `runner.handleSignal`; signals persist in DB only. |
+| Wallet sync scheduler | `scheduleWalletSync()` commented in `startRunner()`; only `scripts/sync-wallets.ts` reaches the logic. |
+| Rewards daily report | `core/rewards-daily-report.ts` implemented but `scheduleRewardsDailyReport()` is never called. |
+| `rebalanceIfNeeded` | Hard-disabled in `inventory-manager.ts` (always returns `'ok'`); break-even hedge replaced it. |
+| Monitoring strategies | Five strategies implemented but commented out of `strategies/registry.ts`. |
+| `score_too_low` exit | Commented out in the rewards executor. |
 
 ## Known architecture debt
 
 - `core/clob-client.ts` logs wallet/funder debug information during client initialization; avoid expanding this and consider reducing operational exposure.
-- `core/order-replacer.ts` reuses `entryMidprice` as the last-reprice reference; a dedicated `last_reprice_midprice` column would be cleaner.
+- `core/order-replacer.ts` reuses `entryMidprice` as the last-reprice reference but never updates it, so repricing measures against the original entry mid.
+- Repriced real orders are inserted with `clobOrderId=null`, so fill detection silently loses track of them.
+- `fetchRewardMarkets` returns `volume_24hr=0` and no `market_competitiveness`, so the `maxVolume24hUsdc` filter is a no-op and sizing always uses the <5k liquidity tier.
+- Planned order rows are inserted before posting and real postings insert again — ghost `simulated` rows accumulate in `orders`.
+- Hedge/reprice/requeue trackers are in-memory only; a restart can duplicate behavior (e.g. double break-even SELL).
+- `signal_cooldowns` (raw SQL in `core/cooldown.ts`) exists in neither `db/schema.ts` nor `db/migration.sql`.
+- `package.json` references nonexistent scripts (`scripts/migrate.ts`, `scripts/verify-auth2.ts`).
+- `POLY_SIGNATURE_TYPE` defaults to 2 in `clob-client.ts` but 1 in `scripts/generate-api-keys.ts`.
+- Fee estimation always uses the `'unknown'` category (`parseCategory(null)`); market tags are ignored.
 - Several implemented strategies are commented out in `strategies/registry.ts`; behavior in production is therefore narrower than the codebase suggests.
+- `scripts/update-markets.ts` is actually a `positions.market_slug` backfill, not a market update.
 - Tests are not defined in `package.json`; `yarn build` is currently the baseline automated verification.
-- Some TODO documents are stale versus implementation state; verify code before trusting TODO status.
+- Behavior-level specs live in `openspec/specs/`; TODO documents in `docs/` were reconciled against implementation in 2026-10.
