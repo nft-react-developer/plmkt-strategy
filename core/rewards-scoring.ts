@@ -25,6 +25,41 @@ export interface ScoreResult {
   rewardUsdc:      number;     // estimación por muestra (1 minuto)
 }
 
+export type RewardTokenSide = 'yes' | 'no';
+
+export function parseTickSize(tickSize: number | string | undefined): number {
+  const parsed = Number(tickSize ?? 0.01);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 0.01;
+}
+
+/**
+ * Normaliza cualquier orden al eje de precio YES.
+ *
+ * BUY NO @ 0.94 es equivalente a SELL YES @ 0.06.
+ * Si no hacemos esta conversión, el bot compara precios NO contra el midpoint
+ * YES y puede creer que una orden está fuera/dentro de rewards incorrectamente.
+ */
+export function toYesEquivalentPrice(price: number, tokenSide: RewardTokenSide): number {
+  return tokenSide === 'no' ? 1 - price : price;
+}
+
+export function distanceFromRewardAnchorCents(
+  price: number,
+  rewardAnchorYes: number,
+  tokenSide: RewardTokenSide,
+): number {
+  return Math.abs(toYesEquivalentPrice(price, tokenSide) - rewardAnchorYes) * 100;
+}
+
+export function isWithinRewardRange(
+  price: number,
+  rewardAnchorYes: number,
+  maxSpreadCents: number,
+  tokenSide: RewardTokenSide,
+): boolean {
+  return distanceFromRewardAnchorCents(price, rewardAnchorYes, tokenSide) <= maxSpreadCents + 1e-9;
+}
+
 /**
  * Función de scoring cuadrática por orden.
  * v = max spread desde midpoint (en centavos)
@@ -32,7 +67,7 @@ export interface ScoreResult {
  * b = in-game multiplier (actualmente 1 en todos los mercados salvo indicación)
  */
 export function scoreOrder(v: number, s: number, b = 1): number {
-  if (s >= v || s < 0) return 0;  // fuera del rango → no puntúa
+  if (s > v || s < 0) return 0;  // fuera del rango → no puntúa
   return Math.pow((v - s) / v, 2) * b;
 }
 
@@ -68,7 +103,7 @@ export function calcSampleScore(
   }
   for (const o of ordersNo) {
     if (o.side !== 'sell') continue;
-    const s = Math.abs(o.price - midprice) * 100;
+    const s = distanceFromRewardAnchorCents(o.price, midprice, 'no');
     qne += scoreOrder(v, s) * o.sizeShares;
   }
 
@@ -81,7 +116,7 @@ export function calcSampleScore(
   }
   for (const o of ordersNo) {
     if (o.side !== 'buy') continue;
-    const s = Math.abs(o.price - midprice) * 100;
+    const s = distanceFromRewardAnchorCents(o.price, midprice, 'no');
     qno += scoreOrder(v, s) * o.sizeShares;
   }
 
@@ -144,6 +179,7 @@ export function calcOrderPrices(
   sizePerSideUsdc:   number,
   dualSideRequired:  boolean,
   placement:         PlacementStrategy = 'mid',
+  tickSize:          number | string = 0.01,
 ): Array<{ side: 'buy' | 'sell'; price: number; sizeUsdc: number; sizeShares: number; spreadFromMidCents: number }> {
 
   let targetSpreadCents: number;
@@ -160,10 +196,21 @@ export function calcOrderPrices(
   const rawBid = midprice - targetSpread;
   const rawAsk = midprice + targetSpread;
 
-  // ← AÑADIR: redondear al tick size (0.01)
-  const tick    = 0.01;
-  const bidPrice = Math.max(0.01, Math.round(rawBid / tick) * tick);
-  const askPrice = Math.min(0.99, Math.round(rawAsk / tick) * tick);
+  const tick = parseTickSize(tickSize);
+  const decimals = Math.max(0, Math.ceil(Math.log10(1 / tick)));
+  const roundToTick = (value: number, mode: 'up' | 'down') => {
+    const units = value / tick;
+    const rounded = mode === 'up' ? Math.ceil(units - 1e-9) : Math.floor(units + 1e-9);
+    return Number((rounded * tick).toFixed(decimals));
+  };
+
+  // Redondear SIEMPRE hacia adentro del rango:
+  // - bid: subir hacia el midpoint
+  // - ask: bajar hacia el midpoint
+  // Si redondeamos al tick más cercano, rawAsk=6.5c puede saltar a 7c y quedar
+  // justo en el borde o fuera del rango que paga rewards.
+  const bidPrice = Math.max(0.01, roundToTick(rawBid, 'up'));
+  const askPrice = Math.min(0.99, roundToTick(rawAsk, 'down'));
 
   const bidShares = sizePerSideUsdc / bidPrice;
   const askShares = sizePerSideUsdc / askPrice;

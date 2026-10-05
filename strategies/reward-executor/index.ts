@@ -25,7 +25,17 @@
 
 import { Strategy, StrategyRunResult }                                              from '../../core/strategy.interface';
 import { CooldownManager }                                                           from '../../core/cooldown';
-import { calcSampleScore, calcMidprice, calcOrderPrices, ScoredOrder, PlacementStrategy } from '../../core/rewards-scoring';
+import {
+  calcSampleScore,
+  calcMidprice,
+  calcOrderPrices,
+  distanceFromRewardAnchorCents,
+  isWithinRewardRange,
+  parseTickSize,
+  ScoredOrder,
+  PlacementStrategy,
+  toYesEquivalentPrice,
+} from '../../core/rewards-scoring';
 import { positionQueries, orderQueries, accrualQueries }                             from '../../db/queries-paper';
 import { orderBookQueries }                                                          from '../../db/queries';
 import { calcTakerFee, parseCategory }                                               from '../../utils/fees';
@@ -293,21 +303,23 @@ export const rewardsExecutorStrategy: Strategy = {
         console.log(`[rewards_executor]   DB orders (paper) #${pos.id}: ${posOrders.length} ordenes`);
       }
 
+      // Polymarket rewards se evalúan contra el precio de referencia del reward.
+      // Si existe last trade lo usamos como anchor; si no, fallback al midpoint.
+      const rewardAnchor = lastTradePrice ?? midprice;
+
       const score = calcSampleScore(
-        ordersYes, ordersNo, midprice,
+        ordersYes, ordersNo, rewardAnchor,
         Number(pos.maxSpreadCents),
         Number(pos.scalingFactorC),
         Number(pos.totalLiquidityUsdc ?? 1000),
         Number(pos.dailyRewardUsdc),
       );
 
-      // inRange: hay órdenes activas dentro del spread de rewards respecto al lastPrice
-      const priceRef = lastTradePrice ?? midprice;
       const maxSpread = Number(pos.maxSpreadCents);
-      const inRange =
-        ordersYes.some(o => Math.abs(o.price - priceRef) * 100 < maxSpread) ||
-        ordersNo.some(o => Math.abs(o.price - (1 - priceRef)) * 100 < maxSpread);
-      score.inRange = inRange;
+      const hasOrderInRewardRange =
+        ordersYes.some(o => isWithinRewardRange(o.price, rewardAnchor, maxSpread, 'yes')) ||
+        ordersNo.some(o => isWithinRewardRange(o.price, rewardAnchor, maxSpread, 'no'));
+      score.inRange = score.inRange && hasOrderInRewardRange;
 
       await accrualQueries.insert({
         positionId: pos.id, paperTrading: pos.paperTrading, midprice,
@@ -420,23 +432,34 @@ export const rewardsExecutorStrategy: Strategy = {
 
         // Reprecio si el precio se movio mucho
         const reprice = await repriceIfNeeded(
-          pos.id, pos.tokenIdYes, midprice,
+          pos.id, pos.tokenIdYes, rewardAnchor,
           Number(pos.maxSpreadCents), Number(pos.sizePerSideUsdc),
           pos.dualSideRequired ?? false,
-          { paperTrading: false, repricingThresholdCents: 1.5 },
+          {
+            paperTrading: false,
+            repricingThresholdCents: 1.5,
+            tokenIdNo: pos.tokenIdNo ?? undefined,
+          },
         ).catch(() => null);
 
         // Detectar si alguna orden activa quedó fuera del rango de rewards.
         // Combina YES (liveOrders) y NO (ordersNo convertido a equivalente YES).
         // Las órdenes NO se comparan como 1-price porque YES+NO=1.
-        const maxSpreadDecimal = Number(pos.maxSpreadCents) / 100;
         const liveYes = invState?.liveOrders ?? [];
-        // ordersNo usa precio del token NO — convertir a equivalente YES para la comparación
-        const liveNoAsYes = ordersNo.map(o => ({ ...o, price: 1 - o.price }));
-        const liveAll = [...liveYes, ...liveNoAsYes];
-        const ordersOutOfRange = liveAll.some(o =>
-          Math.abs(o.price - midprice) > maxSpreadDecimal,
-        );
+        const liveYesRange = liveYes.map(o => ({
+          side: o.side,
+          priceYes: toYesEquivalentPrice(o.price, 'yes'),
+          distCents: distanceFromRewardAnchorCents(o.price, rewardAnchor, 'yes'),
+          outOfRange: !isWithinRewardRange(o.price, rewardAnchor, Number(pos.maxSpreadCents), 'yes'),
+        }));
+        const liveNoRange = ordersNo.map(o => ({
+          side: o.side,
+          priceYes: toYesEquivalentPrice(o.price, 'no'),
+          distCents: distanceFromRewardAnchorCents(o.price, rewardAnchor, 'no'),
+          outOfRange: !isWithinRewardRange(o.price, rewardAnchor, Number(pos.maxSpreadCents), 'no'),
+        }));
+        const rangeChecks = [...liveYesRange, ...liveNoRange];
+        const ordersOutOfRange = rangeChecks.length > 0 && rangeChecks.some(o => o.outOfRange);
         // Health check vía API de Polymarket: earning_percentage = 0 tras N minutos → fuera de rango
         const minutesOpen     = (Date.now() - (pos.openedAt?.getTime() ?? 0)) / 60_000;
         const earningPct      = earningsMap?.get(pos.marketId) ?? null;
@@ -446,43 +469,41 @@ export const rewardsExecutorStrategy: Strategy = {
           minutesOpen > p.earningsCheckDelayMinutes
         );
 
-        const isOutOfRange = !score.inRange;
+        const isOutOfRange = ordersOutOfRange || earningsOutOfRange || !score.inRange;
 
         console.log(
           `[rewards_executor]   outOfRange check #${pos.id}` +
-          ` maxSpread=${(maxSpreadDecimal * 100).toFixed(1)}c mid=${(midprice * 100).toFixed(1)}c` +
-          ` liveYES=[${liveYes.map(o => `${o.side}@${(o.price * 100).toFixed(1)}c`).join(', ') || 'ninguna'}]` +
-          ` liveNO=[${liveNoAsYes.map(o => `@${(o.price * 100).toFixed(1)}c(≡YES) dist=${(Math.abs(o.price - midprice) * 100).toFixed(2)}c`).join(', ') || 'ninguna'}]` +
-          ` outOfRange=${ordersOutOfRange} earningPct=${earningPct !== null ? earningPct.toFixed(4) : 'n/a'} earningsOOR=${earningsOutOfRange}`,
+          ` maxSpread=${Number(pos.maxSpreadCents).toFixed(1)}c anchor=${(rewardAnchor * 100).toFixed(1)}c mid=${(midprice * 100).toFixed(1)}c` +
+          ` liveYES=[${liveYesRange.map(o => `${o.side}@${(o.priceYes * 100).toFixed(1)}c dist=${o.distCents.toFixed(2)}c`).join(', ') || 'ninguna'}]` +
+          ` liveNO=[${liveNoRange.map(o => `${o.side}@${(o.priceYes * 100).toFixed(1)}c≡YES dist=${o.distCents.toFixed(2)}c`).join(', ') || 'ninguna'}]` +
+          ` ordersOOR=${ordersOutOfRange} scoreInRange=${score.inRange} earningPct=${earningPct !== null ? earningPct.toFixed(4) : 'n/a'} earningsOOR=${earningsOutOfRange}`,
         );
 
         if (reprice?.action === 'repriced') {
           console.log(`[rewards_executor]   REPRICED #${pos.id} ${(reprice.oldMidprice! * 100).toFixed(1)}c -> ${(reprice.newMidprice! * 100).toFixed(1)}c`);
         } else if (!bookAnalysis.wallProtects || isOutOfRange) {
-          // const requeue = await requeueIfNeeded(
-          //   pos.id, pos.tokenIdYes,
-          //   Number(pos.maxSpreadCents), Number(pos.sizePerSideUsdc),
-          //   pos.dualSideRequired ?? false, midprice,
-          //   { requeueIntervalMinutes: p.requeueIntervalMinutes, paperTrading: false, forceIfOutOfRange: isOutOfRange },
-          // ).catch(() => null);
-          await positionQueries.close(pos.id, "manual");
-          await cancelAllForMarket(pos.tokenIdYes).catch(err =>
-              logger.error(`[rewards_executor] Cancel tokenId Yes ${pos.tokenIdYes}`, err),
-            );
-            if (pos.tokenIdNo){
-              await cancelAllForMarket(pos.tokenIdNo).catch(err =>
-              logger.error(`[rewards_executor] Cancel tokenId No ${pos.tokenIdNo}`, err),
-              );
-            }
-            
-          // if (requeue?.action === 'requeued') {
-          //   const reason = isOutOfRange && bookAnalysis.wallProtects
-          //     ? earningsOutOfRange
-          //       ? `earning=0 tras ${minutesOpen.toFixed(0)}min (muralla ignorada)`
-          //       : 'ordenes fuera de rango (muralla ignorada)'
-          //     : 'sin muralla';
-          //   console.log(`[rewards_executor]   REQUEUE #${pos.id} (${reason})`);
-          // }
+          const requeue = await requeueIfNeeded(
+            pos.id, pos.tokenIdYes,
+            Number(pos.maxSpreadCents), Number(pos.sizePerSideUsdc),
+            pos.dualSideRequired ?? false, rewardAnchor,
+            {
+              requeueIntervalMinutes: p.requeueIntervalMinutes,
+              paperTrading: false,
+              forceIfOutOfRange: isOutOfRange,
+              tokenIdNo: pos.tokenIdNo ?? undefined,
+            },
+          ).catch(() => null);
+
+          if (requeue?.action === 'requeued') {
+            const reason = isOutOfRange && bookAnalysis.wallProtects
+              ? earningsOutOfRange
+                ? `earning=0 tras ${minutesOpen.toFixed(0)}min (muralla ignorada)`
+                : 'ordenes fuera de rango (muralla ignorada)'
+              : 'sin muralla';
+            console.log(`[rewards_executor]   REQUEUE #${pos.id} (${reason})`);
+          } else {
+            console.log(`[rewards_executor]   REQUEUE omitido #${pos.id}: ${requeue?.reason ?? 'error desconocido'}`);
+          }
         } else {
           console.log(`[rewards_executor]   HOLD #${pos.id} — muralla $${bookAnalysis.maxWallUsdc.toFixed(0)} protege, ordenes en rango`);
         }
@@ -490,18 +511,26 @@ export const rewardsExecutorStrategy: Strategy = {
       } else {
         // Paper: reprecio + re-queue periodico solo si sin muralla
         const reprice = await repriceIfNeeded(
-          pos.id, pos.tokenIdYes, midprice,
+          pos.id, pos.tokenIdYes, rewardAnchor,
           Number(pos.maxSpreadCents), Number(pos.sizePerSideUsdc),
           pos.dualSideRequired ?? false,
-          { paperTrading: true, repricingThresholdCents: 1.5 },
+          {
+            paperTrading: true,
+            repricingThresholdCents: 1.5,
+            tokenIdNo: pos.tokenIdNo ?? undefined,
+          },
         ).catch(() => null);
 
         if (reprice?.action !== 'repriced' && !bookAnalysis.wallProtects) {
           await requeueIfNeeded(
             pos.id, pos.tokenIdYes,
             Number(pos.maxSpreadCents), Number(pos.sizePerSideUsdc),
-            pos.dualSideRequired ?? false, midprice,
-            { requeueIntervalMinutes: p.requeueIntervalMinutes, paperTrading: true },
+            pos.dualSideRequired ?? false, rewardAnchor,
+            {
+              requeueIntervalMinutes: p.requeueIntervalMinutes,
+              paperTrading: true,
+              tokenIdNo: pos.tokenIdNo ?? undefined,
+            },
           ).catch(() => {});
         }
       }
@@ -621,6 +650,8 @@ export const rewardsExecutorStrategy: Strategy = {
         const maxSpreadCents   = market.spread;
         const minSizeShares    = Number(market.rewards_min_size   ?? 0);
         const dualSideRequired = midprice < 0.10 || midprice > 0.90;
+        const tickSize         = parseTickSize(market.minimum_tick_size ?? 0.01);
+        const tickSizeStr      = String(tickSize) as '0.1' | '0.01' | '0.001' | '0.0001';
 
         // Ajustar sizePerSide para garantizar minSizeShares en ambos lados (YES y NO)
         // El lado más caro en USDC es el que tiene precio más alto → max(midprice, 1-midprice)
@@ -631,17 +662,18 @@ export const rewardsExecutorStrategy: Strategy = {
           console.log(`[rewards_executor]   skip ${market.question.slice(0, 60)} — minShares ${minSizeShares} requiere $${minSizeUsdc.toFixed(0)}/lado > capital disponible`);
           continue;
         }
+        const effectiveSizeUsdc = effectiveSizePerSide * 2;
 
         const anchor = lastPrice ?? midprice;
         console.log(`[rewards_executor]   anchor lastPrice=${lastPrice} midprice=${midprice} → using ${anchor}`);
-        const plannedOrders = calcOrderPrices(anchor, maxSpreadCents, effectiveSizePerSide, dualSideRequired, p.placementStrategy);
+        const plannedOrders = calcOrderPrices(anchor, maxSpreadCents, effectiveSizePerSide, dualSideRequired, p.placementStrategy, tickSize);
 
         const category  = parseCategory(null);
         const feeEntry  = plannedOrders.reduce((s, o) => s + calcTakerFee(o.price, category) * o.sizeUsdc, 0);
         const entrySpreadCents = bestBid && bestAsk ? (bestAsk - bestBid) * 100 : null;
 
         const totalDepth     = bookAnalysis.bidDepthUsdc + bookAnalysis.askDepthUsdc;
-        const estimatedShare = totalDepth > 0 ? (sizeUsdc / totalDepth) * 100 : 0;
+        const estimatedShare = totalDepth > 0 ? (effectiveSizeUsdc / totalDepth) * 100 : 0;
 
         const positionId = await positionQueries.open({
           paperTrading: p.paperTrading, marketId: market.condition_id,
@@ -650,25 +682,26 @@ export const rewardsExecutorStrategy: Strategy = {
           tokenIdNo: tokenNo?.token_id, rewardId: String(config.id),
           dailyRewardUsdc: ratePerDay, maxSpreadCents, minSizeShares,
           rewardEndDate: new Date(config.end_date), scalingFactorC: 3.0,
-          sizeUsdc, sizePerSideUsdc: sizePerSide,
+          sizeUsdc: effectiveSizeUsdc, sizePerSideUsdc: effectiveSizePerSide,
           entryMidprice: midprice, entryBid: bestBid ?? undefined,
           entryAsk: bestAsk ?? undefined, entrySpreadCents: entrySpreadCents ?? undefined,
           dualSideRequired, totalLiquidityUsdc: liquidityUsdc,
         });
 
-        // Insertar órdenes planificadas en DB (sin clobOrderId aún, se actualizan abajo)
-        await orderQueries.insertMany(
-          plannedOrders.map(o => ({
-            positionId, paperTrading: p.paperTrading, tokenId: tokenYes.token_id,
-            side: o.side, price: o.price, sizeUsdc: o.sizeUsdc,
-            sizeShares: o.sizeShares, spreadFromMidCents: o.spreadFromMidCents,
-          })),
-        );
+        // En paper guardamos las órdenes planificadas directamente.
+        // En real se guardan recién después de postear, con clobOrderId real.
+        if (p.paperTrading) {
+          await orderQueries.insertMany(
+            plannedOrders.map(o => ({
+              positionId, paperTrading: true, tokenId: tokenYes.token_id,
+              side: o.side, price: o.price, sizeUsdc: o.sizeUsdc,
+              sizeShares: o.sizeShares, spreadFromMidCents: o.spreadFromMidCents,
+            })),
+          );
+        }
 
         // Real trading: colocar ordenes en el CLOB
         if (!p.paperTrading) {
-          const tickSizeStr = String(market.minimum_tick_size ?? 0.01) as '0.1' | '0.01' | '0.001' | '0.0001';
-
           // Rastrear órdenes filladas inmediatamente (status: matched)
           let immediatelyFilled = false;
           let ordersPostedCount = 0;
@@ -811,7 +844,7 @@ export const rewardsExecutorStrategy: Strategy = {
           : '';
         console.log(
           `[rewards_executor]   ABIERTA #${positionId} — ${market.question.slice(0, 45)}` +
-          ` | $${sizeUsdc.toFixed(0)} USDC (${estimatedShare.toFixed(1)}% share)` +
+          ` | $${effectiveSizeUsdc.toFixed(0)} USDC (${estimatedShare.toFixed(1)}% share)` +
           ` | rate=$${ratePerDay}/d | mid=${(midprice * 100).toFixed(1)}c` +
           ` | maxSpread=${maxSpreadCents}c | wall=$${bookAnalysis.maxWallUsdc.toFixed(0)}` +
           ` | depth=$${bookAnalysis.minDepthUsdc.toFixed(0)}` +
@@ -825,7 +858,7 @@ export const rewardsExecutorStrategy: Strategy = {
           body: [
             `<b>Mercado:</b> ${market.question}`,
             `<b>Rate rewards:</b> $${ratePerDay}/dia`,
-            `<b>Capital:</b> $${sizeUsdc.toFixed(0)} USDC (share estimado: ${estimatedShare.toFixed(1)}%)`,
+            `<b>Capital:</b> $${effectiveSizeUsdc.toFixed(0)} USDC (share estimado: ${estimatedShare.toFixed(1)}%)`,
             `<b>Depth minimo lado:</b> $${bookAnalysis.minDepthUsdc.toFixed(0)}`,
             `<b>Muralla maxima:</b>    $${bookAnalysis.maxWallUsdc.toFixed(0)}`,
             `<b>Max spread:</b> ${maxSpreadCents}c | Placement: ${p.placementStrategy}`,
@@ -837,9 +870,9 @@ export const rewardsExecutorStrategy: Strategy = {
             p.manualEntryOnly ? `<b>Entrada manual:</b> Sí ` : `<b>Entrada manual:</b> No`
 
           ].join('\n'),
-          metadata: {
+            metadata: {
             positionId, marketId: market.condition_id, rewardId: config.id,
-            ratePerDay, maxSpread: maxSpreadCents, midprice, sizeUsdc,
+            ratePerDay, maxSpread: maxSpreadCents, midprice, sizeUsdc: effectiveSizeUsdc,
             estimatedSharePct: estimatedShare, paperTrading: p.paperTrading,
           },
         });
@@ -926,6 +959,8 @@ async function openPositionForMarket(
   const maxSpreadCents   = market.spread;
   const minSizeShares    = Number(market.rewards_min_size ?? 0);
   const dualSideRequired = midprice < 0.10 || midprice > 0.90;
+  const tickSize         = parseTickSize(market.minimum_tick_size ?? 0.01);
+  const tickSizeStr      = String(tickSize) as '0.1' | '0.01' | '0.001' | '0.0001';
 
   const minSizeUsdc = minSizeShares > 0 ? minSizeShares * Math.max(midprice, 1 - midprice) : 0;
   const effectiveSizePerSide = minSizeUsdc > sizePerSide ? minSizeUsdc : sizePerSide;
@@ -934,9 +969,10 @@ async function openPositionForMarket(
     logger.warn(`[manual] skip ${market.question.slice(0, 60)} — minShares ${minSizeShares} requiere $${minSizeUsdc.toFixed(0)}/lado > capital`);
     return;
   }
+  const effectiveSizeUsdc = effectiveSizePerSide * 2;
 
   const anchor = lastPrice ?? midprice;
-  const plannedOrders = calcOrderPrices(anchor, maxSpreadCents, effectiveSizePerSide, dualSideRequired, p.placementStrategy);
+  const plannedOrders = calcOrderPrices(anchor, maxSpreadCents, effectiveSizePerSide, dualSideRequired, p.placementStrategy, tickSize);
 
   const category  = parseCategory(null);
   const feeEntry  = plannedOrders.reduce((s, o) => s + calcTakerFee(o.price, category) * o.sizeUsdc, 0);
@@ -944,7 +980,7 @@ async function openPositionForMarket(
 
   const totalDepth     = (book.bids.reduce((s, l) => s + Number(l.size) * Number(l.price), 0)) +
                          (book.asks.reduce((s, l) => s + Number(l.size) * Number(l.price), 0));
-  const estimatedShare = totalDepth > 0 ? (sizeUsdc / totalDepth) * 100 : 0;
+  const estimatedShare = totalDepth > 0 ? (effectiveSizeUsdc / totalDepth) * 100 : 0;
 
   const positionId = await positionQueries.open({
     paperTrading: p.paperTrading, marketId: market.condition_id,
@@ -953,22 +989,23 @@ async function openPositionForMarket(
     tokenIdNo: tokenNo?.token_id, rewardId: String(config.id),
     dailyRewardUsdc: ratePerDay, maxSpreadCents, minSizeShares,
     rewardEndDate: new Date(config.end_date), scalingFactorC: 3.0,
-    sizeUsdc, sizePerSideUsdc: sizePerSide,
+    sizeUsdc: effectiveSizeUsdc, sizePerSideUsdc: effectiveSizePerSide,
     entryMidprice: midprice, entryBid: bestBid ?? undefined,
     entryAsk: bestAsk ?? undefined, entrySpreadCents: entrySpreadCents ?? undefined,
     dualSideRequired, totalLiquidityUsdc: liquidityUsdc,
   });
 
-  await orderQueries.insertMany(
-    plannedOrders.map(o => ({
-      positionId, paperTrading: p.paperTrading, tokenId: tokenYes.token_id,
-      side: o.side, price: o.price, sizeUsdc: o.sizeUsdc,
-      sizeShares: o.sizeShares, spreadFromMidCents: o.spreadFromMidCents,
-    })),
-  );
+  if (p.paperTrading) {
+    await orderQueries.insertMany(
+      plannedOrders.map(o => ({
+        positionId, paperTrading: true, tokenId: tokenYes.token_id,
+        side: o.side, price: o.price, sizeUsdc: o.sizeUsdc,
+        sizeShares: o.sizeShares, spreadFromMidCents: o.spreadFromMidCents,
+      })),
+    );
+  }
 
   if (!p.paperTrading) {
-    const tickSizeStr = String(market.minimum_tick_size ?? 0.01) as '0.1' | '0.01' | '0.001' | '0.0001';
     let immediatelyFilled = false;
     let ordersPostedCount = 0;
     const filledOrders: { tokenId: string; price: number; size: number }[] = [];
@@ -1081,12 +1118,12 @@ async function openPositionForMarket(
     body: [
       `<b>Mercado:</b> ${market.question}`,
       `<b>Rate rewards:</b> $${ratePerDay}/dia`,
-      `<b>Capital:</b> $${sizeUsdc.toFixed(0)} USDC (share estimado: ${estimatedShare.toFixed(1)}%)`,
+      `<b>Capital:</b> $${effectiveSizeUsdc.toFixed(0)} USDC (share estimado: ${estimatedShare.toFixed(1)}%)`,
       `<b>Modo:</b> ${p.paperTrading ? 'Paper' : 'Real'}`,
     ].join('\n'),
     metadata: {
       positionId, marketId: market.condition_id, rewardId: config.id,
-      ratePerDay, maxSpread: maxSpreadCents, midprice, sizeUsdc,
+      ratePerDay, maxSpread: maxSpreadCents, midprice, sizeUsdc: effectiveSizeUsdc,
       estimatedSharePct: estimatedShare, paperTrading: p.paperTrading,
     },
   });

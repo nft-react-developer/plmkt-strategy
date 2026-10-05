@@ -18,7 +18,7 @@
 // En real trading:  cancela y recoloca con el cliente autenticado.
 
 import { cancelOrder, cancelAllForMarket, postOrder } from './clob-client';
-import { calcMidprice, calcOrderPrices }              from './rewards-scoring';
+import { calcMidprice, calcOrderPrices, parseTickSize, PlacementStrategy } from './rewards-scoring';
 import { orderQueries, positionQueries }              from '../db/queries-paper';
 import { calcTakerFee, parseCategory }               from '../utils/fees';
 import { logger }                                    from '../utils/logger';
@@ -30,6 +30,10 @@ export interface RepricerParams {
   repricingThresholdCents: number;  // mover si el mid se fue mas de X¢ (default: 1.5)
   maxRepricesPerHour:      number;  // max reprices por posicion por hora (default: 10)
   paperTrading:            boolean;
+  tokenIdNo?:              string;
+  negRisk?:                boolean;
+  tickSize?:               number | string;
+  placementStrategy?:      PlacementStrategy;
 }
 
 const DEFAULT_PARAMS: RepricerParams = {
@@ -37,6 +41,32 @@ const DEFAULT_PARAMS: RepricerParams = {
   maxRepricesPerHour:      10,
   paperTrading:            true,
 };
+
+type TickSizeString = '0.1' | '0.01' | '0.001' | '0.0001';
+
+function toTickSizeString(tickSize: number | string | undefined): TickSizeString {
+  return String(parseTickSize(tickSize)) as TickSizeString;
+}
+
+function toExecutableOrder(
+  order: { side: 'buy' | 'sell'; price: number; sizeUsdc: number; sizeShares: number },
+  tokenIdYes: string,
+  tokenIdNo: string | undefined,
+  minSizeShares: number,
+) {
+  const isSellYes = order.side === 'sell';
+  const tokenId = isSellYes && tokenIdNo ? tokenIdNo : tokenIdYes;
+  const price = isSellYes && tokenIdNo
+    ? Number((1 - order.price).toFixed(6))
+    : order.price;
+  const rawSize = isSellYes && tokenIdNo
+    ? order.sizeUsdc / price
+    : order.sizeShares;
+  const size = minSizeShares > 0 ? Math.max(rawSize, minSizeShares) : rawSize;
+  const side = isSellYes && !tokenIdNo ? Side.SELL : Side.BUY;
+
+  return { tokenId, price, size, side };
+}
 
 // Tracking de cuántas veces se reprecio cada posición en la última hora
 const repriceCount = new Map<number, { count: number; windowStart: number }>();
@@ -105,7 +135,16 @@ export async function repriceIfNeeded(
   );
 
   // Calcular nuevas órdenes al midprice actual
-  const newOrders = calcOrderPrices(currentMidprice, maxSpreadCents, sizePerSideUsdc, dualSideRequired);
+  const tickSize = parseTickSize(p.tickSize);
+  const tickSizeStr = toTickSizeString(tickSize);
+  const newOrders = calcOrderPrices(
+    currentMidprice,
+    maxSpreadCents,
+    sizePerSideUsdc,
+    dualSideRequired,
+    p.placementStrategy ?? 'mid',
+    tickSize,
+  );
 
   const category = parseCategory(null);
   const feesPaid = newOrders.reduce((sum, o) => sum + calcTakerFee(o.price, category) * o.sizeUsdc, 0);
@@ -140,15 +179,19 @@ export async function repriceIfNeeded(
     try {
       // 1. Cancelar todas las órdenes del mercado de golpe
       await cancelAllForMarket(tokenIdYes);
+      if (p.tokenIdNo) await cancelAllForMarket(p.tokenIdNo);
       logger.info(`[order-replacer] Ordenes canceladas para token ${tokenIdYes.slice(0, 10)}`);
 
       // 2. Colocar nuevas órdenes
       for (const o of newOrders) {
+        const exec = toExecutableOrder(o, tokenIdYes, p.tokenIdNo, Number(pos.minSizeShares ?? 0));
         const posted = await postOrder({
-          tokenId:  tokenIdYes,
-          price:    o.price,
-          size:     o.sizeShares,
-          side:     o.side === 'buy' ? Side.BUY : Side.SELL,
+          tokenId:  exec.tokenId,
+          price:    exec.price,
+          size:     exec.size,
+          side:     exec.side,
+          negRisk:  p.negRisk ?? false,
+          tickSize: tickSizeStr,
           postOnly: true,
         });
 
@@ -159,12 +202,14 @@ export async function repriceIfNeeded(
         await orderQueries.insertMany([{
           positionId,
           paperTrading:       false,
-          tokenId:            tokenIdYes,
-          side:               o.side,
-          price:              o.price,
+          tokenId:            exec.tokenId,
+          side:               exec.side === Side.BUY ? 'buy' : 'sell',
+          price:              exec.price,
           sizeUsdc:           o.sizeUsdc,
-          sizeShares:         o.sizeShares,
+          sizeShares:         exec.size,
           spreadFromMidCents: o.spreadFromMidCents,
+          clobOrderId:        posted.orderId,
+          status:             posted.status === 'matched' ? 'filled' : 'open',
         }]);
       }
 
@@ -223,6 +268,16 @@ export interface RequeueResult {
   reason?: string;
 }
 
+export interface RequeueParams {
+  requeueIntervalMinutes: number;
+  paperTrading:           boolean;
+  forceIfOutOfRange?:     boolean;  // saltea el rate limit si las órdenes están fuera de rango
+  tokenIdNo?:             string;
+  negRisk?:               boolean;
+  tickSize?:              number | string;
+  placementStrategy?:     PlacementStrategy;
+}
+
 /**
  * Re-queue FIFO: cancela y repone las ordenes en el MISMO precio
  * para subir al tope de la cola de ejecucion.
@@ -240,11 +295,7 @@ export async function requeueIfNeeded(
   sizePerSideUsdc:  number,
   dualSideRequired: boolean,
   currentMidprice:  number,
-  params: {
-    requeueIntervalMinutes: number;
-    paperTrading:           boolean;
-    forceIfOutOfRange?:     boolean;  // saltea el rate limit si las órdenes están fuera de rango
-  },
+  params: RequeueParams,
 ): Promise<RequeueResult> {
   const intervalMs  = params.requeueIntervalMinutes * 60_000;
   const lastRequeue = requeueTimestamps.get(positionId) ?? 0;
@@ -257,7 +308,17 @@ export async function requeueIfNeeded(
 
   logger.info(`[order-replacer] Re-queue FIFO #${positionId} | mid=${(currentMidprice * 100).toFixed(1)}c`);
 
-  const newOrders = calcOrderPrices(currentMidprice, maxSpreadCents, sizePerSideUsdc, dualSideRequired);
+  const pos = await positionQueries.getById(positionId);
+  const tickSize = parseTickSize(params.tickSize);
+  const tickSizeStr = toTickSizeString(tickSize);
+  const newOrders = calcOrderPrices(
+    currentMidprice,
+    maxSpreadCents,
+    sizePerSideUsdc,
+    dualSideRequired,
+    params.placementStrategy ?? 'mid',
+    tickSize,
+  );
 
   if (params.paperTrading) {
     await orderQueries.insertMany(
@@ -281,25 +342,31 @@ export async function requeueIfNeeded(
 
   try {
     await cancelAllForMarket(tokenIdYes);
+    if (params.tokenIdNo) await cancelAllForMarket(params.tokenIdNo);
     for (const o of newOrders) {
+      const exec = toExecutableOrder(o, tokenIdYes, params.tokenIdNo, Number(pos?.minSizeShares ?? 0));
       const posted = await postOrder({
-        tokenId:  tokenIdYes,
-        price:    o.price,
-        size:     o.sizeShares,
-        side:     o.side === 'buy' ? Side.BUY : Side.SELL,
+        tokenId:  exec.tokenId,
+        price:    exec.price,
+        size:     exec.size,
+        side:     exec.side,
+        negRisk:  params.negRisk ?? false,
+        tickSize: tickSizeStr,
         postOnly: true,
       });
       await orderQueries.insertMany([{
         positionId,
         paperTrading:       false,
-        tokenId:            tokenIdYes,
-        side:               o.side,
-        price:              o.price,
+        tokenId:            exec.tokenId,
+        side:               exec.side === Side.BUY ? 'buy' : 'sell',
+        price:              exec.price,
         sizeUsdc:           o.sizeUsdc,
-        sizeShares:         o.sizeShares,
+        sizeShares:         exec.size,
         spreadFromMidCents: o.spreadFromMidCents,
+        clobOrderId:        posted.orderId,
+        status:             posted.status === 'matched' ? 'filled' : 'open',
       }]);
-      logger.info(`[order-replacer] Re-queue REAL ${o.side} @ ${o.price.toFixed(4)} | id: ${posted.orderId}`);
+      logger.info(`[order-replacer] Re-queue REAL ${exec.side} @ ${exec.price.toFixed(4)} | token=${exec.tokenId.slice(0, 10)} | id: ${posted.orderId}`);
     }
     requeueTimestamps.set(positionId, now);
     console.log(`[order-replacer] Re-queue REAL #${positionId} completado`);
