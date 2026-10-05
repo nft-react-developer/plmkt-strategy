@@ -84,8 +84,8 @@ The bot processes the queued market on the next rewards executor tick.
 | Sizing | Uses dynamic capital allocation based on liquidity, bounded by configured limits. |
 | Placement | Places BUY/SELL style liquidity orders in paper or real mode. |
 | Monitoring | Samples book state, computes estimated reward score, tracks in-range status, and stores accruals. |
-| Maintenance | Reprices after meaningful midprice moves and requeues when orders are out of range or no wall protects queue position. |
-| Exit | Closes positions on reward end, rate drop, price move, max age, or manual close reason. |
+| Maintenance | Reprices after meaningful midprice moves. Wall break / out-of-range **closes** the position in real mode (`close_reason='manual'`); paper mode still requeues FIFO when unprotected. |
+| Exit | Closes positions on reward end, rate drop, price move, max age, or wall-break/out-of-range (real mode). Manual close reason is also used for aborts during opening. |
 
 ## Operator-facing metrics
 
@@ -133,5 +133,12 @@ Out of scope unless explicitly designed:
 - Add automated tests around rewards scoring, order placement decisions, and inventory sync.
 - Add a dedicated `last_reprice_midprice` field instead of overloading `entryMidprice`.
 - Promote manual close/position controls into API/Telegram flows.
-- Add clearer real-vs-estimated reward reconciliation reports.
-- Reconcile stale TODO documents with current implementation state.
+- Add clearer real-vs-estimated reward reconciliation reports (the rewards daily report exists in code but has no scheduler).
+- Decide the intended real-mode behavior for wall-break/out-of-range: close (current) vs requeue (commented out).
+- Version the missing market-making DDL (`positions`, `orders`, `reward_accruals`, `daily_pnl`, `manual_entry_queue`, `signal_cooldowns`) in `db/migration.sql`.
+
+## Specs
+
+Behavior-level capability specs (current state) live in `openspec/specs/`; project
+context in `openspec/project.md`. Future behavior changes should be proposed as
+spec deltas against those specs (spec-first).

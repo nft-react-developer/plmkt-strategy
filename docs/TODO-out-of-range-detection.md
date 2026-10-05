@@ -1,6 +1,13 @@
 # TODO: Detección confiable de órdenes fuera del rango de rewards
 
-## Estado: RESUELTO
+## Estado: RESUELTO (revisado 2026-10)
+
+> > **Cambio posterior de comportamiento**: la detección sigue funcionando, pero
+> > la acción en **modo real** ya no es requeue: si la orden queda fuera de
+> > rango o la muralla se rompe, el executor **cierra la posición** con
+> > `close_reason='manual'` (`strategies/reward-executor/index.ts` ~L461-468).
+> > El requeue FIFO solo sigue activo en modo paper. Ver
+> > `openspec/specs/rewards-executor/spec.md`.
 
 ## Síntoma
 

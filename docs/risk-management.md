@@ -115,27 +115,28 @@ La función toma el máximo de BID y ASK **sin considerar de qué lado está**. 
 
 ### Override por out-of-range
 
-Si alguna orden activa quedó **fuera del rango de rewards** (`|precio_orden - midprice| > maxSpreadCents/100`), se fuerza el requeue **ignorando la wall protection**:
+Si alguna orden activa quedó **fuera del rango de rewards**
+(`|precio_orden − midprice| > maxSpreadCents/100`), o el health check de
+earnings reporta `earning_percentage=0` pasado el delay configurado, el
+comportamiento difiere por modo:
 
-```typescript
-const ordersOutOfRange = dbOrders.some(o =>
-  Math.abs(Number(o.price) - midprice) > maxSpreadDecimal,
-);
+- **Modo real**: el executor **cierra la posición** con `close_reason='manual'`
+  y cancela todas las órdenes del mercado. El requeue forzado está comentado
+  (`strategies/reward-executor/index.ts` ~L461-468).
+- **Modo paper**: se fuerza el requeue **ignorando la wall protection** con
+  `forceIfOutOfRange`.
 
-if (!bookAnalysis.wallProtects || ordersOutOfRange) {
-  // requeue forzado
-}
-```
-
-Una orden fuera de rango no gana rewards de todas formas, así que perder la posición en la cola no tiene costo.
+Una orden fuera de rango no gana rewards de todas formas, así que perder la
+posición en la cola no tiene costo.
 
 ---
 
 ## Reprecio vs Re-queue
 
-| Mecanismo | Cuándo | Qué hace |
-|-----------|--------|----------|
-| `repriceIfNeeded` | Mid se movió > 1.5¢ desde entry | Cancela y recoloca al nuevo midprice |
-| `requeueIfNeeded` | Sin muralla o fuera de rango | Cancela y recoloca en el **mismo precio** para subir en la cola FIFO |
+| Mecanismo | Cuándo | Qué hace | Modo |
+|-----------|--------|----------|------|
+| `repriceIfNeeded` | Mid se movió > 1.5¢ desde el mid de entrada | Cancela y recoloca al nuevo midprice | Ambos |
+| `requeueIfNeeded` | Sin muralla (y pasó el cooldown de 45 min) | Cancela y recoloca en el **mismo precio** para subir en la cola FIFO | Solo paper hoy |
+| Cierre `manual` | Muralla rota u orden fuera de rango (sin reprice previo) | Cierra la posición y cancela todo | Solo real |
 
-El requeue en el mismo precio tiene sentido porque el CLOB de Polymarket es FIFO — al cancelar y reponer quedás al tope de la cola de ese precio si sos el único en ese tick.
+El requeue en el mismo precio tiene sentido porque el CLOB de Polymarket es FIFO — al cancelar y reponer quedás al tope de la cola de ese precio si sos el único en ese tick. En modo real este camino está comentado y reemplazado por el cierre.

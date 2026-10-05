@@ -1,6 +1,37 @@
 # TODO: Validar minSizeShares antes de entrar a un mercado
 
-## Estado: SIN IMPLEMENTAR
+## Estado: IMPLEMENTADO con variante (revisado 2026-10)
+
+> La protección existe, pero se implementó como **size-bump** en lugar del
+> skip-gate propuesto acá: el bot sube el tamaño de la orden para cumplir el
+> mínimo en vez de saltear el mercado. Detalle al día en
+> `openspec/specs/rewards-executor/spec.md` (Requirement: Sizing dinámico y
+> minSize).
+
+## Comportamiento real (implementación final)
+
+En `strategies/reward-executor/index.ts` (apertura automática ~L625 y manual
+~L930):
+
+```ts
+const minSizeUsdc = minSizeShares > 0 ? minSizeShares * Math.max(midprice, 1 - midprice) : 0;
+const effectiveSizePerSide = minSizeUsdc > sizePerSide ? minSizeUsdc : sizePerSide;
+
+if (minSizeShares > 0 && effectiveSizePerSide > p.totalCapitalUsdc / 2) {
+  // skip: minShares requiere más capital del disponible por lado
+}
+```
+
+- Si el tamaño calculado no alcanza `rewards_min_size`, el bot **aumenta**
+  `sizePerSide` al mínimo requerido.
+- Solo se **saltea** el mercado cuando cumplir el mínimo exige más de
+  `totalCapitalUsdc / 2` por lado.
+- Además, al postear en modo real, el size se floorea con
+  `Math.max(rawSize, minSizeShares)`.
+- Adicionalmente, el discovery ya filtra mercados con
+  `rewards_min_size > fetchMaxMinSize` (default 50).
+
+## Diseño original (propuesta no aplicada)
 
 ## Problema
 
@@ -50,7 +81,14 @@ if (minSizeShares > 0 && minEstimatedShares < minSizeShares) {
 Colocar este check justo después de calcular `minSizeShares` (línea ~558),
 antes de `calcOrderPrices`.
 
-## Notas
+## Por qué el diseño cambió
+
+El size-bump cumple el mismo objetivo (no quedar con órdenes por debajo del
+mínimo sin rewards) sin desperdiciar mercados donde alcanza con comprometer un
+poco más de capital. El skip por capital insuficiente cubre el caso límite que
+el TODO original quería evitar (órdenes demasiado pequeñas para premiar).
+
+## Notas del diseño original
 
 - `minSizeShares` es el mínimo de shares por orden que exige Polymarket para
   computar la orden en el cálculo de rewards. Órdenes más pequeñas son ignoradas.
